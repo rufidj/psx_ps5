@@ -67,6 +67,19 @@ struct psx_system {
     u32  cd_cmd_cnt;      /* total commands received */
     u32  cd_irq_pending;  /* 0=none 1=INT3 2=INT2 3=INT5(error) */
     u32  cd_resp_pos;     /* byte position within multi-byte response */
+    s32  cd_fd;           /* game.bin file descriptor */
+    u32  cd_sector;       /* target sector (LBA) */
+    u32  cd_data_pos;     /* position within current sector being read */
+    u8   cd_sector_buf[2352]; /* buffer for one RAW sector */
+    u32  cd_p_idx;        /* parameter index */
+    u32  cd_bcd[8];       /* parameter buffer */
+    u8   cd_resp_buf[16]; /* response FIFO */
+    u32  cd_resp_len;     /* total bytes in response */
+    u8   cd_resp_second[16]; /* delayed second response */
+    u32  cd_resp_second_len;
+    u32  cd_irq_second;   /* IRQ code for second response (e.g. 2=INT2) */
+    u32  cd_mode;         /* bit 5: 1=RAW, 0=Data */
+    u32  cd_read_active;  /* 1 = drive is reading sectors */
 
     /* DMA channels – only MADR and BCR stored (CHCR triggers execution) */
     u32  dma_madr[8];
@@ -76,6 +89,8 @@ struct psx_system {
     u32  exception_vec;  /* non-zero = exception taken, skip delay slot, jump here */
 
     struct psx_gpu_io gpu_io;
+    void *G; /* eboot base + gadget offset */
+    void *kopen_fn, *klseek_fn, *kread_fn;
 };
 
 #endif /* PSX_TYPES_H */

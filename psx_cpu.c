@@ -91,17 +91,7 @@ static void psx_cpu_execute(struct psx_system *psx, u32 ins)
         break;
     }
 
-    /* ── REGIMM group (op=0x01): BLTZ/BGEZ/BLTZAL/BGEZAL ────────── */
-    case 0x01: {
-        u32 sub    = (ins >> 16) & 0x1F;
-        int link   = (sub & 0x10) != 0;
-        int is_gez = (sub & 0x01) != 0;
-        int taken  = is_gez ? ((s32)psx->regs[rs] >= 0)
-                             : ((s32)psx->regs[rs] <  0);
-        if (link) psx->regs[31] = psx->pc + 8;
-        if (taken) psx->next_pc = psx->pc + 4 + (imm_s << 2);
-        break;
-    }
+
 
     /* ── Jumps ────────────────────────────────────────────────────── */
     case 0x02: /* J */
@@ -113,6 +103,14 @@ static void psx_cpu_execute(struct psx_system *psx, u32 ins)
         break;
 
     /* ── Branches ─────────────────────────────────────────────────── */
+    case 0x01: { /* REGIMM instructions */
+        u32 sub = rt;
+        if (sub == 0x00) { if ((s32)psx->regs[rs] < 0) psx->next_pc = psx->pc + 4 + (imm_s << 2); } /* BLTZ */
+        if (sub == 0x01) { if ((s32)psx->regs[rs] >= 0) psx->next_pc = psx->pc + 4 + (imm_s << 2); } /* BGEZ */
+        if (sub == 0x10) { if ((s32)psx->regs[rs] < 0) { psx->regs[31] = psx->pc + 8; psx->next_pc = psx->pc + 4 + (imm_s << 2); } } /* BLTZAL */
+        if (sub == 0x11) { if ((s32)psx->regs[rs] >= 0) { psx->regs[31] = psx->pc + 8; psx->next_pc = psx->pc + 4 + (imm_s << 2); } } /* BGEZAL */
+        break;
+    }
     case 0x04: /* BEQ  */
         if (psx->regs[rs] == psx->regs[rt])
             psx->next_pc = psx->pc + 4 + (imm_s << 2);
@@ -145,67 +143,63 @@ static void psx_cpu_execute(struct psx_system *psx, u32 ins)
         if      (rs == 0x00) psx->regs[rt] = psx->cp0_regs[rd]; /* MFC0 */
         else if (rs == 0x04) psx->cp0_regs[rd] = psx->regs[rt]; /* MTC0 */
         else if (rs == 0x10 && (ins & 0x3F) == 0x10) { /* RFE */
-            /* Restore KU/IE: shift KUp,IEp into KUc,IEc */
             u32 sr = psx->cp0_regs[12];
-            psx->cp0_regs[12] = (sr & ~0x0Fu) | ((sr >> 2) & 0x0Fu);
+            psx->cp0_regs[12] = (sr & ~0x3Fu) | ((sr >> 2) & 0x0Fu);
         }
         break;
 
     /* ── Memory loads ─────────────────────────────────────────────── */
-    case 0x20: { /* LB  – signed byte */
-        u32 v = psx_bus_read(psx, psx->regs[rs] + imm_s, 1);
-        psx->regs[rt] = (u32)(s32)(s8)v;
-        break;
-    }
-    case 0x21: { /* LH  – signed halfword */
-        u32 v = psx_bus_read(psx, psx->regs[rs] + imm_s, 2);
-        psx->regs[rt] = (u32)(s32)(s16)v;
-        break;
-    }
+    case 0x20: psx->regs[rt] = (u32)(s32)(s8)psx_bus_read(psx, psx->regs[rs] + imm_s, 1); break; /* LB */
+    case 0x21: psx->regs[rt] = (u32)(s32)(s16)psx_bus_read(psx, psx->regs[rs] + imm_s, 2); break; /* LH */
+    case 0x23: psx->regs[rt] = psx_bus_read(psx, psx->regs[rs] + imm_s, 4); break; /* LW */
+    case 0x24: psx->regs[rt] = psx_bus_read(psx, psx->regs[rs] + imm_s, 1); break; /* LBU */
+    case 0x25: psx->regs[rt] = psx_bus_read(psx, psx->regs[rs] + imm_s, 2); break; /* LHU */
+    
     case 0x22: { /* LWL – load word left (unaligned) */
-        u32 addr  = psx->regs[rs] + imm_s;
-        u32 shift = (addr & 3) * 8;
-        u32 mask  = 0xFFFFFFFFu << shift;
-        u32 mem   = psx_bus_read(psx, addr & ~3u, 4);
-        psx->regs[rt] = (psx->regs[rt] & ~mask) | (mem << shift);
+        u32 addr = psx->regs[rs] + imm_s;
+        u32 mem  = psx_bus_read(psx, addr & ~3u, 4);
+        u32 mod  = addr & 3;
+        if      (mod == 0) psx->regs[rt] = (psx->regs[rt] & 0x00FFFFFFu) | (mem << 24);
+        else if (mod == 1) psx->regs[rt] = (psx->regs[rt] & 0x0000FFFFu) | (mem << 16);
+        else if (mod == 2) psx->regs[rt] = (psx->regs[rt] & 0x000000FFu) | (mem << 8);
+        else if (mod == 3) psx->regs[rt] = mem;
         break;
     }
-    case 0x23: /* LW */
-        psx->regs[rt] = psx_bus_read(psx, psx->regs[rs] + imm_s, 4);
-        break;
-    case 0x24: /* LBU – unsigned byte */
-        psx->regs[rt] = psx_bus_read(psx, psx->regs[rs] + imm_s, 1);
-        break;
-    case 0x25: /* LHU – unsigned halfword */
-        psx->regs[rt] = psx_bus_read(psx, psx->regs[rs] + imm_s, 2);
-        break;
     case 0x26: { /* LWR – load word right (unaligned) */
-        u32 addr  = psx->regs[rs] + imm_s;
-        u32 shift = ((~addr) & 3) * 8;
-        u32 mask  = 0xFFFFFFFFu >> shift;
-        u32 mem   = psx_bus_read(psx, addr & ~3u, 4);
-        psx->regs[rt] = (psx->regs[rt] & ~mask) | (mem >> shift);
+        u32 addr = psx->regs[rs] + imm_s;
+        u32 mem  = psx_bus_read(psx, addr & ~3u, 4);
+        u32 mod  = addr & 3;
+        if      (mod == 0) psx->regs[rt] = mem;
+        else if (mod == 1) psx->regs[rt] = (psx->regs[rt] & 0xFF000000u) | (mem >> 8);
+        else if (mod == 2) psx->regs[rt] = (psx->regs[rt] & 0xFFFF0000u) | (mem >> 16);
+        else if (mod == 3) psx->regs[rt] = (psx->regs[rt] & 0xFFFFFF00u) | (mem >> 24);
         break;
     }
 
     /* ── Memory stores ────────────────────────────────────────────── */
     case 0x28: psx_bus_write(psx, psx->regs[rs] + imm_s, psx->regs[rt], 1); break; /* SB */
     case 0x29: psx_bus_write(psx, psx->regs[rs] + imm_s, psx->regs[rt], 2); break; /* SH */
-    case 0x2A: { /* SWL – store word left (unaligned) */
-        u32 addr  = psx->regs[rs] + imm_s;
-        u32 shift = (addr & 3) * 8;
-        u32 mask  = 0xFFFFFFFFu >> (24u - shift);
-        u32 mem   = psx_bus_read(psx, addr & ~3u, 4);
-        psx_bus_write(psx, addr & ~3u, (mem & ~mask) | (psx->regs[rt] >> (24u - shift)), 4);
+    case 0x2A: { /* SWL – store word left (unaligned, Little-Endian) */
+        u32 addr = psx->regs[rs] + imm_s;
+        u32 mem  = psx_bus_read(psx, addr & ~3u, 4);
+        u32 mod  = addr & 3;
+        if      (mod == 0) mem = (mem & 0xFFFFFF00u) | (psx->regs[rt] >> 24);
+        else if (mod == 1) mem = (mem & 0xFFFF0000u) | (psx->regs[rt] >> 16);
+        else if (mod == 2) mem = (mem & 0xFF000000u) | (psx->regs[rt] >> 8);
+        else if (mod == 3) mem = psx->regs[rt];
+        psx_bus_write(psx, addr & ~3u, mem, 4);
         break;
     }
     case 0x2B: psx_bus_write(psx, psx->regs[rs] + imm_s, psx->regs[rt], 4); break; /* SW */
-    case 0x2E: { /* SWR – store word right (unaligned) */
-        u32 addr  = psx->regs[rs] + imm_s;
-        u32 shift = ((~addr) & 3) * 8;
-        u32 mask  = 0xFFFFFFFFu << (24u - shift);
-        u32 mem   = psx_bus_read(psx, addr & ~3u, 4);
-        psx_bus_write(psx, addr & ~3u, (mem & mask) | (psx->regs[rt] << (24u - shift)), 4);
+    case 0x2E: { /* SWR – store word right (unaligned, Little-Endian) */
+        u32 addr = psx->regs[rs] + imm_s;
+        u32 mem  = psx_bus_read(psx, addr & ~3u, 4);
+        u32 mod  = addr & 3;
+        if      (mod == 0) mem = psx->regs[rt];
+        else if (mod == 1) mem = (mem & 0x000000FFu) | (psx->regs[rt] << 8);
+        else if (mod == 2) mem = (mem & 0x0000FFFFu) | (psx->regs[rt] << 16);
+        else if (mod == 3) mem = (mem & 0x00FFFFFFu) | (psx->regs[rt] << 24);
+        psx_bus_write(psx, addr & ~3u, mem, 4);
         break;
     }
 
@@ -273,4 +267,6 @@ void psx_cpu_step(struct psx_system *psx)
     } else {
         psx->pc = psx->next_pc;
     }
+
+    psx->regs[0] = 0; /* R0 must always be zero */
 }
