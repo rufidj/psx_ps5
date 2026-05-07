@@ -8,6 +8,7 @@ struct psx_gpu {
 
 /* Forward: psx_local_zero is in psx_main.c (same TU) */
 static void psx_local_zero(u8 *p, u32 n);
+static u16 gpu_modulate_texel(u16 texel, u32 color24);
 
 /* GP0 command length – pure computation, no static data */
 static u32 gpu_gp0_cmd_len(u8 cmd)
@@ -38,6 +39,16 @@ static u32 gpu_gp0_cmd_len(u8 cmd)
     return 1;
 }
 
+static int gpu_is_polyline_cmd(u8 cmd)
+{
+    return ((cmd >= 0x48 && cmd <= 0x4Fu) || (cmd >= 0x58 && cmd <= 0x5Fu));
+}
+
+static int gpu_polyline_terminator(u32 word)
+{
+    return ((word & 0xF000F000u) == 0x50005000u);
+}
+
 /* ─── helpers ─────────────────────────────────────────────────────── */
 
 /* Textured triangle with UV interpolation.
@@ -47,7 +58,8 @@ static void gpu_draw_tri_tex_uv(struct psx_gpu_io *g,
     s32 x0, s32 y0, s32 u0, s32 v0,
     s32 x1, s32 y1, s32 u1, s32 v1,
     s32 x2, s32 y2, s32 u2, s32 v2,
-    u32 cl_x, u32 cl_y)
+    u32 cl_x, u32 cl_y,
+    u32 c0, u32 c1, u32 c2)
 {
     if (!g->vram) return;
     x0 += g->off_x; y0 += g->off_y;
@@ -68,6 +80,9 @@ static void gpu_draw_tri_tex_uv(struct psx_gpu_io *g,
     s32 total_h = y2 - y0; if (total_h == 0) return;
     u32 tp_x  = (g->texpage & 0xFu) * 64u;
     u32 tp_y  = ((g->texpage >> 4) & 1u) * 256u;
+    s32 r0 = (s32)(c0 & 0xFFu), g0 = (s32)((c0 >> 8) & 0xFFu), b0 = (s32)((c0 >> 16) & 0xFFu);
+    s32 r1 = (s32)(c1 & 0xFFu), g1 = (s32)((c1 >> 8) & 0xFFu), b1 = (s32)((c1 >> 16) & 0xFFu);
+    s32 r2 = (s32)(c2 & 0xFFu), g2 = (s32)((c2 >> 8) & 0xFFu), b2 = (s32)((c2 >> 16) & 0xFFu);
 
     for (s32 y = y0; y <= y2; y++) {
         /* Scissor clipping */
@@ -80,37 +95,56 @@ static void gpu_draw_tri_tex_uv(struct psx_gpu_io *g,
         s32 xA = x0 + (((x2 - x0) * t_ab) >> 16);
         s32 uA = u0 + (((u2 - u0) * t_ab) >> 16);
         s32 vA = v0 + (((v2 - v0) * t_ab) >> 16);
+        s32 rA = r0 + (((r2 - r0) * t_ab) >> 16);
+        s32 gA = g0 + (((g2 - g0) * t_ab) >> 16);
+        s32 bA = b0 + (((b2 - b0) * t_ab) >> 16);
         
-        s32 xB, uB, vB;
+        s32 xB, uB, vB, rB, gB, bB;
         if (y <= y1) {
             s32 h01 = y1 - y0; if (!h01) h01 = 1;
             s32 t = ((y - y0) << 16) / h01;
             xB = x0 + (((x1 - x0) * t) >> 16);
             uB = u0 + (((u1 - u0) * t) >> 16);
             vB = v0 + (((v1 - v0) * t) >> 16);
+            rB = r0 + (((r1 - r0) * t) >> 16);
+            gB = g0 + (((g1 - g0) * t) >> 16);
+            bB = b0 + (((b1 - b0) * t) >> 16);
         } else {
             s32 h12 = y2 - y1; if (!h12) h12 = 1;
             s32 t = ((y - y1) << 16) / h12;
             xB = x1 + (((x2 - x1) * t) >> 16);
             uB = u1 + (((u2 - u1) * t) >> 16);
             vB = v1 + (((v2 - v1) * t) >> 16);
+            rB = r1 + (((r2 - r1) * t) >> 16);
+            gB = g1 + (((g2 - g1) * t) >> 16);
+            bB = b1 + (((b2 - b1) * t) >> 16);
         }
 
         if (xA > xB) {
             s32 tx=xA; xA=xB; xB=tx;
             s32 tu=uA; uA=uB; uB=tu;
             s32 tv=vA; vA=vB; vB=tv;
+            s32 tr=rA; rA=rB; rB=tr;
+            s32 tg=gA; gA=gB; gB=tg;
+            s32 tb=bA; bA=bB; bB=tb;
         }
 
         s32 span = xB - xA; if (span < 1) span = 1;
         s32 du = ((uB - uA) << 16) / span;
         s32 dv = ((vB - vA) << 16) / span;
+        s32 dr = ((rB - rA) << 16) / span;
+        s32 dg = ((gB - gA) << 16) / span;
+        s32 db = ((bB - bA) << 16) / span;
         s32 cur_u = uA << 16;
         s32 cur_v = vA << 16;
+        s32 cur_r = rA << 16;
+        s32 cur_g = gA << 16;
+        s32 cur_b = bA << 16;
 
         for (s32 x = xA; x <= xB; x++) {
             if (x < g->draw_x1 || x > g->draw_x2) {
                 cur_u += du; cur_v += dv;
+                cur_r += dr; cur_g += dg; cur_b += db;
                 continue;
             }
             u32 ux = (u32)x & 0x3FFu;
@@ -135,8 +169,15 @@ static void gpu_draw_tri_tex_uv(struct psx_gpu_io *g,
                 texel = g->vram[((tp_y + v) & 0x1FFu) * 1024u + ((tp_x + u) & 0x3FFu)];
             }
 
-            if (texel != 0) g->vram[uy * 1024u + ux] = texel;
+            if (texel != 0) {
+                u32 mod =
+                    ((u32)((cur_r >> 16) & 0xFFu)) |
+                    ((u32)((cur_g >> 16) & 0xFFu) << 8) |
+                    ((u32)((cur_b >> 16) & 0xFFu) << 16);
+                g->vram[uy * 1024u + ux] = gpu_modulate_texel(texel, mod);
+            }
             cur_u += du; cur_v += dv;
+            cur_r += dr; cur_g += dg; cur_b += db;
         }
     }
 }
@@ -231,6 +272,62 @@ static u32 gpu_rgb15_to_bgra8(u16 v)
     return 0xFF000000u | (r << 16) | (g << 8) | b;
 }
 
+static u16 gpu_modulate_texel(u16 texel, u32 color24)
+{
+    u32 tr = texel & 0x1Fu;
+    u32 tg = (texel >> 5) & 0x1Fu;
+    u32 tb = (texel >> 10) & 0x1Fu;
+    u32 cr = color24 & 0xFFu;
+    u32 cg = (color24 >> 8) & 0xFFu;
+    u32 cb = (color24 >> 16) & 0xFFu;
+
+    tr = (tr * cr) >> 7;
+    tg = (tg * cg) >> 7;
+    tb = (tb * cb) >> 7;
+    if (tr > 0x1Fu) tr = 0x1Fu;
+    if (tg > 0x1Fu) tg = 0x1Fu;
+    if (tb > 0x1Fu) tb = 0x1Fu;
+    return (u16)(tr | (tg << 5) | (tb << 10) | (texel & 0x8000u));
+}
+
+static void gpu_vram_put(struct psx_gpu_io *g, s32 x, s32 y, u16 col);
+
+static void gpu_draw_line_shaded(struct psx_gpu_io *g,
+    s32 x0, s32 y0, u32 c0,
+    s32 x1, s32 y1, u32 c1)
+{
+    x0 += g->off_x; y0 += g->off_y;
+    x1 += g->off_x; y1 += g->off_y;
+
+    s32 dx = x1 - x0;
+    s32 dy = y1 - y0;
+    s32 adx = (dx < 0) ? -dx : dx;
+    s32 ady = (dy < 0) ? -dy : dy;
+    s32 steps = (adx > ady) ? adx : ady;
+    if (steps <= 0) {
+        gpu_vram_put(g, x0, y0, gpu_rgb24_to_15(c0));
+        return;
+    }
+
+    s32 r0 = (s32)(c0 & 0xFFu), g0 = (s32)((c0 >> 8) & 0xFFu), b0 = (s32)((c0 >> 16) & 0xFFu);
+    s32 r1 = (s32)(c1 & 0xFFu), g1 = (s32)((c1 >> 8) & 0xFFu), b1 = (s32)((c1 >> 16) & 0xFFu);
+    s32 xfp = x0 << 16;
+    s32 yfp = y0 << 16;
+    s32 xstep = (dx << 16) / steps;
+    s32 ystep = (dy << 16) / steps;
+
+    for (s32 i = 0; i <= steps; i++) {
+        s32 t = (i << 16) / steps;
+        u32 r = (u32)(r0 + (((r1 - r0) * t) >> 16));
+        u32 gg = (u32)(g0 + (((g1 - g0) * t) >> 16));
+        u32 b = (u32)(b0 + (((b1 - b0) * t) >> 16));
+        u16 col = (u16)((r >> 3) | ((gg >> 3) << 5) | ((b >> 3) << 10));
+        gpu_vram_put(g, xfp >> 16, yfp >> 16, col);
+        xfp += xstep;
+        yfp += ystep;
+    }
+}
+
 /* Write a pixel to VRAM, respecting drawing area */
 static void gpu_vram_put(struct psx_gpu_io *g, s32 x, s32 y, u16 col)
 {
@@ -280,7 +377,7 @@ static void gpu_exec_mono_rect(struct psx_gpu_io *g, s32 w, s32 h)
 
 /* Textured sprite helper – handles 4-bit/8-bit/15-bit textures + CLUT */
 static void gpu_draw_tex_sprite(struct psx_gpu_io *g,
-    s32 sx, s32 sy, s32 w, s32 h, u8 u0, u8 v0, u16 clut_word)
+    s32 sx, s32 sy, s32 w, s32 h, u8 u0, u8 v0, u16 clut_word, u32 color24)
 {
     u32 depth  = (g->texpage >> 7) & 3u;
     u32 tp_x   = (g->texpage & 0xFu) * 64u;
@@ -314,7 +411,41 @@ static void gpu_draw_tex_sprite(struct psx_gpu_io *g,
                 texel  = g->vram[ty * 1024u + tx];
             }
             if (texel == 0) continue; /* transparent */
-            gpu_vram_put(g, px, py, texel);
+            gpu_vram_put(g, px, py, gpu_modulate_texel(texel, color24));
+        }
+    }
+}
+
+static void gpu_exec_polyline(struct psx_gpu_io *g)
+{
+    u32 cmd = g->fifo[0] >> 24;
+    if (cmd >= 0x48 && cmd <= 0x4Fu) {
+        u32 col = g->fifo[0] & 0xFFFFFFu;
+        s32 x0 = (s32)(s16)(g->fifo[1] & 0xFFFFu);
+        s32 y0 = (s32)(s16)(g->fifo[1] >> 16);
+        for (u32 i = 2; i < g->fifo_len; i++) {
+            if (gpu_polyline_terminator(g->fifo[i]))
+                break;
+            s32 x1 = (s32)(s16)(g->fifo[i] & 0xFFFFu);
+            s32 y1 = (s32)(s16)(g->fifo[i] >> 16);
+            gpu_draw_line_shaded(g, x0, y0, col, x1, y1, col);
+            x0 = x1;
+            y0 = y1;
+        }
+    } else if (cmd >= 0x58 && cmd <= 0x5Fu) {
+        u32 c0 = g->fifo[0] & 0xFFFFFFu;
+        s32 x0 = (s32)(s16)(g->fifo[1] & 0xFFFFu);
+        s32 y0 = (s32)(s16)(g->fifo[1] >> 16);
+        for (u32 i = 2; (i + 1) < g->fifo_len; i += 2) {
+            if (gpu_polyline_terminator(g->fifo[i]))
+                break;
+            u32 c1 = g->fifo[i] & 0xFFFFFFu;
+            s32 x1 = (s32)(s16)(g->fifo[i + 1] & 0xFFFFu);
+            s32 y1 = (s32)(s16)(g->fifo[i + 1] >> 16);
+            gpu_draw_line_shaded(g, x0, y0, c0, x1, y1, c1);
+            x0 = x1;
+            y0 = y1;
+            c0 = c1;
         }
     }
 }
@@ -394,9 +525,13 @@ static void gpu_gp0_exec(struct psx_gpu_io *g)
         g->texpage = new_tp & 0x1FFu;
         g->gpustat = (g->gpustat & ~0x7FFu) | (new_tp & 0x7FFu);
         g->clut_x = cl_x; g->clut_y = cl_y;
-        gpu_draw_tri_tex_uv(g, XV(1),YV(1),UV_U(2),UV_V(2),
-                               XV(3),YV(3),UV_U(4),UV_V(4),
-                               XV(5),YV(5),UV_U(6),UV_V(6), cl_x, cl_y);
+        {
+            u32 col = g->fifo[0] & 0xFFFFFFu;
+            gpu_draw_tri_tex_uv(g, XV(1),YV(1),UV_U(2),UV_V(2),
+                                   XV(3),YV(3),UV_U(4),UV_V(4),
+                                   XV(5),YV(5),UV_U(6),UV_V(6), cl_x, cl_y,
+                                   col, col, col);
+        }
         break;
     }
     /* Flat textured quad: cmd+col, xy0,uv0+clut, xy1,uv1+texpage, xy2,uv2, xy3,uv3 */
@@ -410,12 +545,17 @@ static void gpu_gp0_exec(struct psx_gpu_io *g)
         g->texpage = new_tp & 0x1FFu;
         g->gpustat = (g->gpustat & ~0x7FFu) | (new_tp & 0x7FFu);
         g->clut_x = cl_x; g->clut_y = cl_y;
-        gpu_draw_tri_tex_uv(g, XV(1),YV(1),UV_U(2),UV_V(2),
-                               XV(3),YV(3),UV_U(4),UV_V(4),
-                               XV(5),YV(5),UV_U(6),UV_V(6), cl_x, cl_y);
-        gpu_draw_tri_tex_uv(g, XV(5),YV(5),UV_U(6),UV_V(6),
-                               XV(3),YV(3),UV_U(4),UV_V(4),
-                               XV(7),YV(7),UV_U(8),UV_V(8), cl_x, cl_y);
+        {
+            u32 col = g->fifo[0] & 0xFFFFFFu;
+            gpu_draw_tri_tex_uv(g, XV(1),YV(1),UV_U(2),UV_V(2),
+                                   XV(3),YV(3),UV_U(4),UV_V(4),
+                                   XV(5),YV(5),UV_U(6),UV_V(6), cl_x, cl_y,
+                                   col, col, col);
+            gpu_draw_tri_tex_uv(g, XV(5),YV(5),UV_U(6),UV_V(6),
+                                   XV(3),YV(3),UV_U(4),UV_V(4),
+                                   XV(7),YV(7),UV_U(8),UV_V(8), cl_x, cl_y,
+                                   col, col, col);
+        }
         break;
     }
 #undef UV_U
@@ -423,24 +563,53 @@ static void gpu_gp0_exec(struct psx_gpu_io *g)
 #undef CL_WORD
     /* Gouraud textured triangle: c0,xy0,uv0+clut, c1,xy1,uv1+tp, c2,xy2,uv2 */
     case 0x34: case 0x35: case 0x36: case 0x37: {
-        /* Render as Gouraud (colors) + ignore texture for now */
-        u32 c0=g->fifo[0]&0xFFFFFFu, c1=g->fifo[3]&0xFFFFFFu, c2=g->fifo[6]&0xFFFFFFu;
-        gpu_draw_tri_gouraud(g, XV(1),YV(1),c0, XV(4),YV(4),c1, XV(7),YV(7),c2);
+        u16 cl = (u16)((g->fifo[2] >> 16) & 0xFFFFu);
+        u32 cl_x = (u32)(cl & 0x3Fu) * 16u;
+        u32 cl_y = (u32)(cl >> 6) & 0x1FFu;
+        u16 new_tp = (u16)((g->fifo[5] >> 16) & 0xFFFFu);
+        g->texpage = new_tp & 0x1FFu;
+        g->gpustat = (g->gpustat & ~0x7FFu) | (new_tp & 0x7FFu);
+        g->clut_x = cl_x;
+        g->clut_y = cl_y;
+        gpu_draw_tri_tex_uv(g, XV(1),YV(1), (s32)(g->fifo[2] & 0xFFu), (s32)((g->fifo[2] >> 8) & 0xFFu),
+                               XV(4),YV(4), (s32)(g->fifo[5] & 0xFFu), (s32)((g->fifo[5] >> 8) & 0xFFu),
+                               XV(7),YV(7), (s32)(g->fifo[8] & 0xFFu), (s32)((g->fifo[8] >> 8) & 0xFFu),
+                               cl_x, cl_y,
+                               g->fifo[0] & 0xFFFFFFu, g->fifo[3] & 0xFFFFFFu, g->fifo[6] & 0xFFFFFFu);
         break;
     }
     /* Gouraud textured quad */
     case 0x3C: case 0x3D: case 0x3E: case 0x3F: {
-        u32 c0=g->fifo[0]&0xFFFFFFu, c1=g->fifo[3]&0xFFFFFFu;
-        u32 c2=g->fifo[6]&0xFFFFFFu, c3=g->fifo[9]&0xFFFFFFu;
-        gpu_draw_tri_gouraud(g, XV(1),YV(1),c0, XV(4),YV(4),c1, XV(7),YV(7),c2);
-        gpu_draw_tri_gouraud(g, XV(4),YV(4),c1, XV(7),YV(7),c2, XV(10),YV(10),c3);
+        u16 cl = (u16)((g->fifo[2] >> 16) & 0xFFFFu);
+        u32 cl_x = (u32)(cl & 0x3Fu) * 16u;
+        u32 cl_y = (u32)(cl >> 6) & 0x1FFu;
+        u16 new_tp = (u16)((g->fifo[5] >> 16) & 0xFFFFu);
+        g->texpage = new_tp & 0x1FFu;
+        g->gpustat = (g->gpustat & ~0x7FFu) | (new_tp & 0x7FFu);
+        g->clut_x = cl_x;
+        g->clut_y = cl_y;
+        gpu_draw_tri_tex_uv(g, XV(1),YV(1), (s32)(g->fifo[2] & 0xFFu), (s32)((g->fifo[2] >> 8) & 0xFFu),
+                               XV(4),YV(4), (s32)(g->fifo[5] & 0xFFu), (s32)((g->fifo[5] >> 8) & 0xFFu),
+                               XV(7),YV(7), (s32)(g->fifo[8] & 0xFFu), (s32)((g->fifo[8] >> 8) & 0xFFu),
+                               cl_x, cl_y,
+                               g->fifo[0] & 0xFFFFFFu, g->fifo[3] & 0xFFFFFFu, g->fifo[6] & 0xFFFFFFu);
+        gpu_draw_tri_tex_uv(g, XV(7),YV(7), (s32)(g->fifo[8] & 0xFFu), (s32)((g->fifo[8] >> 8) & 0xFFu),
+                               XV(4),YV(4), (s32)(g->fifo[5] & 0xFFu), (s32)((g->fifo[5] >> 8) & 0xFFu),
+                               XV(10),YV(10), (s32)(g->fifo[11] & 0xFFu), (s32)((g->fifo[11] >> 8) & 0xFFu),
+                               cl_x, cl_y,
+                               g->fifo[6] & 0xFFFFFFu, g->fifo[3] & 0xFFFFFFu, g->fifo[9] & 0xFFFFFFu);
         break;
     }
     /* Lines – stub (ignore for now) */
     case 0x40: case 0x41: case 0x42: case 0x43:
     case 0x48: case 0x49: case 0x4A: case 0x4B:
+        gpu_draw_line_shaded(g, XV(1), YV(1), g->fifo[0] & 0xFFFFFFu,
+                                XV(2), YV(2), g->fifo[0] & 0xFFFFFFu);
+        break;
     case 0x50: case 0x51: case 0x52: case 0x53:
     case 0x58: case 0x59: case 0x5A: case 0x5B:
+        gpu_draw_line_shaded(g, XV(1), YV(1), g->fifo[0] & 0xFFFFFFu,
+                                XV(3), YV(3), g->fifo[2] & 0xFFFFFFu);
         break;
 #undef XV
 #undef YV
@@ -448,6 +617,9 @@ static void gpu_gp0_exec(struct psx_gpu_io *g)
     /* Mono rectangles – variable, 8x8, 16x16 */
     case 0x60: case 0x61: case 0x62: case 0x63:
         gpu_exec_mono_rect(g, -1, -1);
+        break;
+    case 0x68: case 0x69: case 0x6A: case 0x6B:
+        gpu_exec_mono_rect(g, 1, 1);
         break;
     case 0x70: case 0x71: case 0x72: case 0x73:
         gpu_exec_mono_rect(g, 8, 8);
@@ -467,7 +639,7 @@ static void gpu_gp0_exec(struct psx_gpu_io *g)
         s32  h  = (s32)((g->fifo[3] >> 16) & 0xFFFFu);
         g->clut_x = (u32)(cl & 0x3Fu) * 16u;
         g->clut_y = (u32)(cl >> 6) & 0x1FFu;
-        gpu_draw_tex_sprite(g, x, y, w, h, u0, v0, cl);
+        gpu_draw_tex_sprite(g, x, y, w, h, u0, v0, cl, g->fifo[0] & 0xFFFFFFu);
         break;
     }
     case 0x74: case 0x75: case 0x76: case 0x77: { /* 8×8 */
@@ -479,7 +651,18 @@ static void gpu_gp0_exec(struct psx_gpu_io *g)
         u16  cl = (u16)((g->fifo[2] >> 16) & 0xFFFFu);
         g->clut_x = (u32)(cl & 0x3Fu) * 16u;
         g->clut_y = (u32)(cl >> 6) & 0x1FFu;
-        gpu_draw_tex_sprite(g, x, y, 8, 8, u0, v0, cl);
+        gpu_draw_tex_sprite(g, x, y, 8, 8, u0, v0, cl, g->fifo[0] & 0xFFFFFFu);
+        break;
+    }
+    case 0x6C: case 0x6D: case 0x6E: case 0x6F: { /* 1×1 */
+        s32  x  = (s32)(s16)(g->fifo[1] & 0xFFFFu);
+        s32  y  = (s32)(s16)((g->fifo[1] >> 16) & 0xFFFFu);
+        u8   u0 = (u8)(g->fifo[2] & 0xFFu);
+        u8   v0 = (u8)((g->fifo[2] >> 8) & 0xFFu);
+        u16  cl = (u16)((g->fifo[2] >> 16) & 0xFFFFu);
+        g->clut_x = (u32)(cl & 0x3Fu) * 16u;
+        g->clut_y = (u32)(cl >> 6) & 0x1FFu;
+        gpu_draw_tex_sprite(g, x, y, 1, 1, u0, v0, cl, g->fifo[0] & 0xFFFFFFu);
         break;
     }
     case 0x7C: case 0x7D: case 0x7E: case 0x7F: { /* 16×16 */
@@ -490,7 +673,7 @@ static void gpu_gp0_exec(struct psx_gpu_io *g)
         u16  cl = (u16)((g->fifo[2] >> 16) & 0xFFFFu);
         g->clut_x = (u32)(cl & 0x3Fu) * 16u;
         g->clut_y = (u32)(cl >> 6) & 0x1FFu;
-        gpu_draw_tex_sprite(g, x, y, 16, 16, u0, v0, cl);
+        gpu_draw_tex_sprite(g, x, y, 16, 16, u0, v0, cl, g->fifo[0] & 0xFFFFFFu);
         break;
     }
 
@@ -524,7 +707,9 @@ static void gpu_gp0_exec(struct psx_gpu_io *g)
         /* Also update GPUSTAT bits 10:0 from texpage word */
         g->gpustat = (g->gpustat & ~0x7FFu) | (g->fifo[0] & 0x7FFu);
         break;
-    case 0xE2: break; /* Texture window – ignored */
+    case 0xE2:
+        g->texwin = g->fifo[0] & 0x000FFFFFu;
+        break;
     case 0xE3: /* Drawing area top-left */
         g->draw_x1 = (s32)(g->fifo[0] & 0x3FFu);
         g->draw_y1 = (s32)((g->fifo[0] >> 10) & 0x3FFu);
@@ -576,7 +761,7 @@ static void gpu_gp0_write(struct psx_gpu_io *g, u32 val)
     g->gp0_total++;  /* count every word received */
     if (g->fifo_len == 0) {
         u8 cmd = (u8)(val >> 24);
-        g->fifo_need = gpu_gp0_cmd_len(cmd);
+        g->fifo_need = gpu_is_polyline_cmd(cmd) ? 0xFFFFFFFFu : gpu_gp0_cmd_len(cmd);
     }
     if (g->fifo_len < 16u) {
         g->fifo[g->fifo_len++] = val;
@@ -586,7 +771,26 @@ static void gpu_gp0_write(struct psx_gpu_io *g, u32 val)
         g->fifo_need = 0;
     }
 
-    if (g->fifo_len >= g->fifo_need && g->fifo_need > 0) {
+    if (g->fifo_need == 0xFFFFFFFFu) {
+        u8 cmd = (u8)(g->fifo[0] >> 24);
+        u32 min_words = (cmd >= 0x58 && cmd <= 0x5Fu) ? 4u : 3u;
+        if (g->fifo_len >= min_words) {
+            u32 term_index = 0xFFFFFFFFu;
+            u32 start = (cmd >= 0x58 && cmd <= 0x5Fu) ? 2u : 2u;
+            for (u32 i = start; i < g->fifo_len; i += ((cmd >= 0x58 && cmd <= 0x5Fu) ? 2u : 1u)) {
+                if (gpu_polyline_terminator(g->fifo[i])) {
+                    term_index = i;
+                    break;
+                }
+            }
+            if (term_index != 0xFFFFFFFFu) {
+                g->fifo_len = term_index;
+                gpu_exec_polyline(g);
+                g->fifo_len = 0;
+                g->fifo_need = 0;
+            }
+        }
+    } else if (g->fifo_len >= g->fifo_need && g->fifo_need > 0) {
         gpu_gp0_exec(g);
         g->fifo_len  = 0;
         g->fifo_need = 0;
@@ -602,6 +806,8 @@ static void gpu_gp1_write(struct psx_gpu_io *g, u32 val)
         g->gpustat      = 0x1C000000u; /* bits 28,27,26=ready */
         g->gpustat     |= 0x02000000u; /* bit 25 = DMA ready */
         g->gpustat     |= 0x08000000u; /* bit 27 = IDLE */
+        g->gpuread      = 0;
+        g->texwin       = 0;
         g->fifo_len     = 0;
         g->fifo_need    = 0;
         g->cpuvram_active = 0;
@@ -610,6 +816,12 @@ static void gpu_gp1_write(struct psx_gpu_io *g, u32 val)
         g->disp_vram_y  = 0;
         g->disp_w       = 320;
         g->disp_h       = 240;
+        g->disp_24bit   = 0;
+        g->disp_mode    = 0;
+        g->disp_x1      = 0x200u;
+        g->disp_x2      = 0x200u + 256u * 10u;
+        g->disp_y1      = 0x010u;
+        g->disp_y2      = 0x010u + 240u;
         g->draw_x1      = 0;  g->draw_y1 = 0;
         g->draw_x2      = 1023; g->draw_y2 = 511;
         g->off_x        = 0;  g->off_y   = 0;
@@ -625,13 +837,21 @@ static void gpu_gp1_write(struct psx_gpu_io *g, u32 val)
         if (g->disp_en) g->gpustat |=  (1u << 23);
         else            g->gpustat &= ~(1u << 23);
         break;
-    case 0x04: /* DMA direction */ break;
+    case 0x04: /* DMA direction */
+        g->gpustat = (g->gpustat & ~(3u << 29)) | ((val & 3u) << 29);
+        break;
     case 0x05: /* Display start in VRAM */
         g->disp_vram_x = val & 0x3FFu;
         g->disp_vram_y = (val >> 10) & 0x1FFu;
         break;
-    case 0x06: /* Horizontal display range – ignored */ break;
-    case 0x07: /* Vertical display range – ignored */   break;
+    case 0x06:
+        g->disp_x1 = val & 0xFFFu;
+        g->disp_x2 = (val >> 12) & 0xFFFu;
+        break;
+    case 0x07:
+        g->disp_y1 = val & 0x3FFu;
+        g->disp_y2 = (val >> 10) & 0x3FFu;
+        break;
     case 0x08: { /* Display mode – no static arrays to avoid rodata issues */
         /* bit[6]=1 → 368; bits[1:0]: 0=256, 1=320, 2=512, 3=640 */
         u32 h368 = (val >> 6) & 1u;
@@ -646,12 +866,26 @@ static void gpu_gp1_write(struct psx_gpu_io *g, u32 val)
                 default: hw = 256u; break;
             }
         }
+        g->disp_mode = val & 0x7Fu;
         g->disp_w = hw;
         g->disp_h = ((val >> 2) & 1u) ? 480u : 240u;
+        g->disp_24bit = (val >> 4) & 1u;
         g->gpustat = (g->gpustat & ~0x7F800u) | ((val & 0x3Fu) << 17);
         break;
     }
-    case 0x10: break; /* GPU info request – result in GPUREAD, ignored */
+    case 0x10: {
+        u32 idx = val & 0xFFFFFFu;
+        switch (idx & 0xFu) {
+        case 0x02: g->gpuread = g->texwin; break;
+        case 0x03: g->gpuread = ((u32)g->draw_y1 << 10) | ((u32)g->draw_x1 & 0x3FFu); break;
+        case 0x04: g->gpuread = ((u32)g->draw_y2 << 10) | ((u32)g->draw_x2 & 0x3FFu); break;
+        case 0x05: g->gpuread = (((u32)g->off_y & 0x7FFu) << 11) | ((u32)g->off_x & 0x7FFu); break;
+        case 0x07: g->gpuread = 0x00000002u; break;
+        case 0x08: g->gpuread = 0x00000000u; break;
+        default: break;
+        }
+        break;
+    }
     default:   break;
     }
 }
@@ -701,12 +935,29 @@ static void psx_gpu_sync_to_ps5(struct psx_system *psx, u32 *target_fb)
     u32 ox = (1920u - dst_w) / 2u;
     u32 oy = (1080u - dst_h) / 2u;
 
-    for (u32 py = 0; py < dst_h; py++) {
-        u32 src_y = vy + py * dh / dst_h;
-        for (u32 px = 0; px < dst_w; px++) {
-            u32 src_x = vx + px * dw / dst_w;
-            u16 pix = g->vram[(src_y & 0x1FFu) * 1024u + (src_x & 0x3FFu)];
-            target_fb[(oy + py) * 1920u + (ox + px)] = gpu_rgb15_to_bgra8(pix);
+    if (g->disp_24bit) {
+        u8 *vram8 = (u8 *)g->vram;
+        for (u32 py = 0; py < dst_h; py++) {
+            u32 src_y = vy + py * dh / dst_h;
+            u32 row_base = (src_y & 0x1FFu) * 2048u + ((vx & 0x3FFu) * 2u);
+            for (u32 px = 0; px < dst_w; px++) {
+                u32 src_x = px * dw / dst_w;
+                u32 boff = row_base + src_x * 3u;
+                u8 r = vram8[(boff + 0u) & 0xFFFFFu];
+                u8 g8 = vram8[(boff + 1u) & 0xFFFFFu];
+                u8 b = vram8[(boff + 2u) & 0xFFFFFu];
+                target_fb[(oy + py) * 1920u + (ox + px)] =
+                    0xFF000000u | ((u32)r << 16) | ((u32)g8 << 8) | (u32)b;
+            }
+        }
+    } else {
+        for (u32 py = 0; py < dst_h; py++) {
+            u32 src_y = vy + py * dh / dst_h;
+            for (u32 px = 0; px < dst_w; px++) {
+                u32 src_x = vx + px * dw / dst_w;
+                u16 pix = g->vram[(src_y & 0x1FFu) * 1024u + (src_x & 0x3FFu)];
+                target_fb[(oy + py) * 1920u + (ox + px)] = gpu_rgb15_to_bgra8(pix);
+            }
         }
     }
 }
