@@ -1,4 +1,5 @@
 #include "psx_bus.c"
+#include "psx_gte.c"
 
 static int psx_cpu_fetch_is_mapped(u32 addr)
 {
@@ -118,7 +119,8 @@ static void psx_cpu_log_bios_call(struct psx_system *psx)
                        fn == 0x99u || fn == 0x9Cu || fn == 0x9Du || fn == 0xA1u);
     } else if (vec == 0xB0u) {
         tag = "[BIOS] B0 fn=";
-        interesting = ((fn >= 0x07u && fn <= 0x0Du) || fn == 0x18u || fn == 0x19u ||
+        interesting = ((fn >= 0x07u && fn <= 0x0Du) || (fn >= 0x12u && fn <= 0x16u) ||
+                       fn == 0x18u || fn == 0x19u ||
                        fn == 0x20u || fn == 0x47u);
     } else if (vec == 0xC0u) {
         tag = "[BIOS] C0 fn=";
@@ -190,6 +192,60 @@ static int psx_cpu_handle_bios_event_call(struct psx_system *psx)
     int slot;
 
     if (vec != 0xB0u) return 0;
+
+    if (fn == 0x12u) { /* InitPAD2(buf1,siz1,buf2,siz2) */
+        psx->bios_pad_buf1 = a0;
+        psx->bios_pad_siz1 = a1;
+        psx->bios_pad_buf2 = a2;
+        psx->bios_pad_siz2 = psx->regs[7];
+        psx->bios_pad_started = 0;
+        psx->bios_pad_use_hidden = 0;
+        psx->bios_pad_button_dest = 0;
+        for (u32 i = 0; i < a1; i++)
+            psx_bus_write(psx, a0 + i, 0u, 1);
+        for (u32 i = 0; i < psx->regs[7]; i++)
+            psx_bus_write(psx, a2 + i, 0u, 1);
+        psx->regs[2] = 2u;
+        psx->pc = psx->regs[31];
+        return 1;
+    }
+
+    if (fn == 0x13u) { /* StartPAD2() */
+        psx->bios_pad_started = 1u;
+        psx->regs[2] = 1u;
+        psx->pc = psx->regs[31];
+        return 1;
+    }
+
+    if (fn == 0x14u) { /* StopPAD2() */
+        psx->bios_pad_started = 0u;
+        psx->regs[2] = 1u;
+        psx->pc = psx->regs[31];
+        return 1;
+    }
+
+    if (fn == 0x15u) { /* PAD_init2(type,button_dest,...) */
+        if (a0 != 0x20000000u && a0 != 0x20000001u) {
+            psx->regs[2] = 0u;
+        } else {
+            for (u32 i = 0; i < 0x22u; i++) {
+                psx->bios_pad_hidden1[i] = 0;
+                psx->bios_pad_hidden2[i] = 0;
+            }
+            psx->bios_pad_use_hidden = 1u;
+            psx->bios_pad_started = 1u;
+            psx->bios_pad_button_dest = a1;
+            psx->regs[2] = 2u;
+        }
+        psx->pc = psx->regs[31];
+        return 1;
+    }
+
+    if (fn == 0x16u) { /* PAD_dr() */
+        psx->regs[2] = psx_pad_bios_dr(psx);
+        psx->pc = psx->regs[31];
+        return 1;
+    }
 
     if (fn == 0x08u) { /* OpenEvent */
         if (a0 == 0xF0000003u && a2 == 0x00002000u) {
@@ -279,6 +335,10 @@ static int psx_cpu_handle_bios_event_call(struct psx_system *psx)
                 } else if (psx->bios_ev_ready & bit) {
                     psx->bios_ev_ready &= ~bit;
                     psx->regs[2] = 1;
+                    /* Reset log cap so post-CD-load activity is visible */
+                    if (psx->bios_call_logs > 64u) psx->bios_call_logs = 64u;
+                    psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
+                               "[BIOS] WaitDone=", a0);
                 } else {
                     /* Real BIOS blocks here until the event becomes ready. */
                     return 1;
@@ -328,12 +388,11 @@ static int psx_cpu_handle_bios_event_call(struct psx_system *psx)
             if (psx->bios_ev_class[slot] != a0 || psx->bios_ev_spec[slot] != a1)
                 continue;
             if (fn == 0x07u) {
-                if (psx->bios_ev_mode[slot] == 0x00002000u) {
-                    if (psx->bios_ev_enabled & bit)
-                        psx->bios_ev_ready |= bit;
-                } else {
-                    /* Callback-mode events stay busy; they do not become ready. */
-                }
+                /* Mark ready regardless of mode so WaitEvent can unblock.
+                 * Real HW marks ready for mode=0x2000 and calls func for
+                 * mode=0x8000; marking ready unconditionally covers both. */
+                if (psx->bios_ev_enabled & bit)
+                    psx->bios_ev_ready |= bit;
                 psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
                            "[BIOS] EvDeliver=", a1);
             } else {
@@ -347,100 +406,14 @@ static int psx_cpu_handle_bios_event_call(struct psx_system *psx)
     return 0;
 }
 
-static s32 psx_gte_sx(u32 reg)
-{
-    return (s32)(s16)(reg & 0xFFFFu);
-}
-
-static s32 psx_gte_sy(u32 reg)
-{
-    return (s32)(s16)((reg >> 16) & 0xFFFFu);
-}
-
-static u32 psx_gte_clamp_s32(s64 v)
-{
-    if (v > 0x7FFFFFFFll) return 0x7FFFFFFFu;
-    if (v < -0x80000000ll) return 0x80000000u;
-    return (u32)(s32)v;
-}
-
-static u32 psx_gte_read_data(struct psx_system *psx, u32 reg)
-{
-    reg &= 31u;
-    if (reg == 29u) return psx->gte_data[28];
-    if (reg == 31u) {
-        u32 lzcs = psx->gte_data[30];
-        u32 n = 0;
-        if (lzcs & 0x80000000u) lzcs = ~lzcs;
-        while (n < 32u && !(lzcs & 0x80000000u)) {
-            lzcs <<= 1;
-            n++;
-        }
-        psx->gte_data[31] = n;
-    }
-    return psx->gte_data[reg];
-}
-
-static void psx_gte_write_data(struct psx_system *psx, u32 reg, u32 val)
-{
-    reg &= 31u;
-    if (reg == 15u) {
-        psx->gte_data[12] = psx->gte_data[13];
-        psx->gte_data[13] = psx->gte_data[14];
-        psx->gte_data[14] = val;
-        psx->gte_data[15] = val;
-        return;
-    }
-    if (reg == 28u || reg == 29u) {
-        psx->gte_data[28] = val & 0x7FFFu;
-        psx->gte_data[29] = psx->gte_data[28];
-        return;
-    }
-    psx->gte_data[reg] = val;
-}
-
 static void psx_gte_exec(struct psx_system *psx, u32 cmd)
 {
-    u32 fn = cmd & 0x3Fu;
-
     if (!psx->gte_cmd_logged) {
         psx->gte_cmd_logged = 1;
-        psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
-                   "[GTE] cmd=", cmd);
-        psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
-                   "[GTE] pc=", psx->pc);
+        psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr, "[GTE] cmd=", cmd);
+        psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr, "[GTE] pc=", psx->pc);
     }
-
-    switch (fn) {
-    case 0x06: { /* NCLIP: signed area from SXY0/1/2 -> MAC0 */
-        s32 sx0 = psx_gte_sx(psx->gte_data[12]);
-        s32 sy0 = psx_gte_sy(psx->gte_data[12]);
-        s32 sx1 = psx_gte_sx(psx->gte_data[13]);
-        s32 sy1 = psx_gte_sy(psx->gte_data[13]);
-        s32 sx2 = psx_gte_sx(psx->gte_data[14]);
-        s32 sy2 = psx_gte_sy(psx->gte_data[14]);
-        s64 mac0 = (s64)sx0 * (sy1 - sy2) +
-                   (s64)sx1 * (sy2 - sy0) +
-                   (s64)sx2 * (sy0 - sy1);
-        psx->gte_data[24] = psx_gte_clamp_s32(mac0);
-        break;
-    }
-    case 0x10: { /* DPCS-ish: keep RGB FIFO moving, expose RGB2 */
-        u32 rgb = psx->gte_data[6];
-        psx->gte_data[20] = psx->gte_data[21];
-        psx->gte_data[21] = psx->gte_data[22];
-        psx->gte_data[22] = rgb;
-        psx->gte_data[24] = rgb & 0xFFu;
-        psx->gte_data[25] = (rgb >> 8) & 0xFFu;
-        psx->gte_data[26] = (rgb >> 16) & 0xFFu;
-        psx->gte_data[27] = psx->gte_data[26];
-        break;
-    }
-    default:
-        /* Conservative fallback: preserve commonly-read result regs. */
-        if (!psx->gte_data[22]) psx->gte_data[22] = psx->gte_data[6];
-        break;
-    }
+    psx_gte_dispatch(psx, cmd);
 }
 
 struct psx_exec_result {

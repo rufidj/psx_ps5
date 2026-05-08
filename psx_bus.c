@@ -9,14 +9,23 @@
 #define ADDR_SCRATCH  0x1F800000u
 #define ADDR_IO       0x1F801000u
 #define ADDR_BIOS     0x1FC00000u
+#define PSX_CD_FIFO_CAP 32u
+#define PSX_CD_FIFO_MASK (PSX_CD_FIFO_CAP - 1u)
+#define SPU_REG_IRQ_ADDR      0xD2u /* 1F801DA4 */
+#define SPU_REG_TRANSFER_ADDR 0xD3u /* 1F801DA6 */
+#define SPU_REG_CTRL          0xD5u /* 1F801DAA */
+#define SPU_REG_STAT          0xD7u /* 1F801DAE */
 
 /* Forward declarations: gpu_gp0_write / gpu_gp1_write defined in psx_gpu.c */
 static void gpu_gp0_write(struct psx_gpu_io *g, u32 val);
 static void gpu_gp1_write(struct psx_gpu_io *g, u32 val);
+static u32 psx_bus_read(struct psx_system *psx, u32 addr, int width);
+static void psx_bus_write(struct psx_system *psx, u32 addr, u32 val, int width);
 static void psx_cd_fifo_reset(struct psx_system *psx);
 static void psx_cd_fifo_sync_state(struct psx_system *psx);
 static void psx_cd_fifo_push(struct psx_system *psx, const u8 *src, u32 size);
 static u8 psx_cd_fifo_read_byte(struct psx_system *psx, int *ok);
+static u32 psx_pad_bios_dr(struct psx_system *psx);
 
 static void psx_sio_reset(struct psx_system *psx)
 {
@@ -35,6 +44,10 @@ static void psx_sio_reset(struct psx_system *psx)
     psx->joy_mc_checksum = 0;
     psx->joy_mc_flag = 0x08u;
     psx->joy_mc_write = 0;
+    psx->joy_pad_config = 0;
+    psx->joy_pad_mode = 0; /* 0=digital */
+    psx->joy_pad_lock = 0;
+    psx->joy_pad_analog = 0;
 }
 
 static void psx_memcard_format_blank(struct psx_system *psx)
@@ -70,9 +83,91 @@ static void psx_sio_raise_irq(struct psx_system *psx)
 static void psx_sio_finish_transfer(struct psx_system *psx, u8 rx, int ack)
 {
     psx->joy_rx_data = rx;
-    psx->joy_rx_ready = 1;
+    psx->joy_rx_ready = 1u;
     if (ack)
         psx_sio_raise_irq(psx);
+}
+
+static void psx_pad_store_buf(struct psx_system *psx, u32 addr, u32 size,
+                              u8 status, u8 id)
+{
+    u16 pad = (u16)(psx->pad_buttons_psx ? psx->pad_buttons_psx : 0xFFFFu);
+    u8 b0 = (u8)(pad & 0xFFu);
+    u8 b1 = (u8)((pad >> 8) & 0xFFu);
+    if (!addr || size == 0)
+        return;
+    psx_bus_write(psx, addr + 0u, status, 1);
+    if (size < 2u)
+        return;
+    psx_bus_write(psx, addr + 1u, id, 1);
+    if (size < 3u)
+        return;
+    psx_bus_write(psx, addr + 2u, b0, 1);
+    if (size < 4u)
+        return;
+    psx_bus_write(psx, addr + 3u, b1, 1);
+    for (u32 i = 4u; i < size; i++)
+        psx_bus_write(psx, addr + i, 0u, 1);
+}
+
+static void psx_pad_store_hidden(u8 *buf, u32 size, u8 status, u8 id, u16 pad)
+{
+    if (!buf || size == 0)
+        return;
+    buf[0] = status;
+    if (size < 2u)
+        return;
+    buf[1] = id;
+    if (size < 3u)
+        return;
+    buf[2] = (u8)(pad & 0xFFu);
+    if (size < 4u)
+        return;
+    buf[3] = (u8)((pad >> 8) & 0xFFu);
+    for (u32 i = 4u; i < size; i++)
+        buf[i] = 0x00u;
+}
+
+static void psx_pad_update_bios_buffers(struct psx_system *psx)
+{
+    u8 id = psx->joy_pad_analog ? 0x73u : 0x41u;
+    u16 pad = (u16)(psx->pad_buttons_psx ? psx->pad_buttons_psx : 0xFFFFu);
+    u32 dr;
+
+    if (!psx->bios_pad_started)
+        return;
+
+    if (psx->bios_pad_use_hidden) {
+        psx_pad_store_hidden(psx->bios_pad_hidden1, 0x22u, 0x00u, id, pad);
+        psx_pad_store_hidden(psx->bios_pad_hidden2, 0x22u, 0xFFu, 0xFFu, 0xFFFFu);
+    } else {
+        psx_pad_store_buf(psx, psx->bios_pad_buf1, psx->bios_pad_siz1, 0x00u, id);
+        psx_pad_store_buf(psx, psx->bios_pad_buf2, psx->bios_pad_siz2, 0xFFu, 0xFFu);
+    }
+
+    if (psx->bios_pad_button_dest) {
+        dr = psx_pad_bios_dr(psx);
+        psx_bus_write(psx, psx->bios_pad_button_dest, dr, 4);
+    }
+}
+
+static u32 psx_pad_bios_dr(struct psx_system *psx)
+{
+    const u8 *buf = psx->bios_pad_use_hidden ? psx->bios_pad_hidden1 : 0;
+    u16 lo = 0xFFFFu;
+    u32 ret;
+
+    if (!buf && psx->bios_pad_buf1 && psx->bios_pad_siz1 >= 4u) {
+        lo = ((psx_bus_read(psx, psx->bios_pad_buf1 + 2u, 1) & 0xFFu) << 8) |
+             (psx_bus_read(psx, psx->bios_pad_buf1 + 3u, 1) & 0xFFu);
+    } else if (buf && buf[1] == 0x41u) {
+        lo = ((u16)buf[2] << 8) | (u16)buf[3];
+    }
+
+    ret = (u32)lo | 0xFFFF0000u;
+    if (psx->bios_pad_button_dest)
+        psx_bus_write(psx, psx->bios_pad_button_dest, ret, 4);
+    return ret;
 }
 
 static void psx_sio_deselect(struct psx_system *psx)
@@ -90,32 +185,262 @@ static void psx_sio_handle_pad(struct psx_system *psx, u8 tx)
 {
     u8 rx = 0xFFu;
     int ack = 1;
+    u16 pad = (u16)(psx->pad_buttons_psx ? psx->pad_buttons_psx : 0xFFFFu);
+    u8 poll_id = psx->joy_pad_analog ? 0x73u : 0x41u;
+    u8 id = psx->joy_pad_config ? 0xF3u : poll_id;
 
     if (psx->joy_phase == 0) {
         psx->joy_cmd = tx;
-        if (tx == 0x42u || tx == 0x43u)
-            rx = 0x41u;
-        else if (tx >= 0x44u && tx <= 0x4Fu)
-            rx = 0x41u;
-        else
-            rx = 0xFFu;
+        rx = id;
         psx->joy_phase = 1;
     } else if (psx->joy_phase == 1) {
         rx = 0x5Au;
         psx->joy_phase = 2;
-    } else if (psx->joy_phase == 2) {
-        rx = 0xFFu;
+    } else if (psx->joy_cmd == 0x42u && psx->joy_phase == 2) {
+        rx = (u8)(pad & 0xFFu);
         psx->joy_phase = 3;
-    } else if (psx->joy_phase == 3) {
-        rx = 0xFFu;
+    } else if (psx->joy_cmd == 0x42u && psx->joy_phase == 3) {
+        rx = (u8)((pad >> 8) & 0xFFu);
+        if (psx->joy_pad_analog)
+            psx->joy_phase = 4;
+        else {
+            ack = 0;
+            psx_sio_deselect(psx);
+        }
+    } else if (psx->joy_cmd == 0x42u && psx->joy_phase == 4) {
+        rx = 0x80u;
+        psx->joy_phase = 5;
+    } else if (psx->joy_cmd == 0x42u && psx->joy_phase == 5) {
+        rx = 0x80u;
+        psx->joy_phase = 6;
+    } else if (psx->joy_cmd == 0x42u && psx->joy_phase == 6) {
+        rx = 0x80u;
+        psx->joy_phase = 7;
+    } else if (psx->joy_cmd == 0x42u && psx->joy_phase == 7) {
+        rx = 0x80u;
         ack = 0;
         psx_sio_deselect(psx);
+    } else if (psx->joy_cmd == 0x43u) {
+        if (psx->joy_phase == 2) {
+            psx->joy_pad_config = (tx == 0x01u) ? 1u : 0u;
+            rx = 0x00u;
+            psx->joy_phase = 3;
+        } else if (psx->joy_phase == 3) {
+            rx = (u8)(pad & 0xFFu);
+            psx->joy_phase = 4;
+        } else if (psx->joy_phase == 4) {
+            rx = (u8)((pad >> 8) & 0xFFu);
+            if (psx->joy_pad_analog)
+                psx->joy_phase = 5;
+            else {
+                ack = 0;
+                psx_sio_deselect(psx);
+            }
+        } else if (psx->joy_phase == 5) {
+            rx = 0x80u;
+            psx->joy_phase = 6;
+        } else if (psx->joy_phase == 6) {
+            rx = 0x80u;
+            psx->joy_phase = 7;
+        } else if (psx->joy_phase == 7) {
+            rx = 0x80u;
+            psx->joy_phase = 8;
+        } else if (psx->joy_phase == 8) {
+            rx = 0x80u;
+            ack = 0;
+            psx_sio_deselect(psx);
+        } else {
+            ack = 0;
+            psx_sio_deselect(psx);
+        }
+    } else if (psx->joy_cmd == 0x44u) {
+        if (psx->joy_phase == 2) {
+            psx->joy_pad_analog = (tx == 0x01u) ? 1u : 0u;
+            psx->joy_pad_mode = psx->joy_pad_analog;
+            rx = psx->joy_pad_analog ? 0x01u : 0x00u;
+            psx->joy_phase = 3;
+        } else if (psx->joy_phase == 3) {
+            psx->joy_pad_lock = tx ? 1u : 0u;
+            rx = 0x00u;
+            ack = 0;
+            psx_sio_deselect(psx);
+        } else {
+            ack = 0;
+            psx_sio_deselect(psx);
+        }
+    } else if (psx->joy_cmd == 0x40u) {
+        static const u8 resp[6] = { 0x00u, 0x00u, 0x02u, 0x02u, 0x02u, 0x02u };
+        if (psx->joy_phase >= 2 && psx->joy_phase < 8) {
+            rx = resp[psx->joy_phase - 2u];
+            if (psx->joy_phase == 7) {
+                ack = 0;
+                psx_sio_deselect(psx);
+            } else {
+                psx->joy_phase++;
+            }
+        } else {
+            ack = 0;
+            psx_sio_deselect(psx);
+        }
+    } else if (psx->joy_cmd == 0x41u) {
+        static const u8 resp_digital[6] = { 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u };
+        static const u8 resp_analog[6]  = { 0x00u, 0x00u, 0x03u, 0x02u, 0x01u, 0x00u };
+        const u8 *resp = psx->joy_pad_analog ? resp_analog : resp_digital;
+        if (psx->joy_phase >= 2 && psx->joy_phase < 8) {
+            rx = resp[psx->joy_phase - 2u];
+            if (psx->joy_phase == 7) {
+                ack = 0;
+                psx_sio_deselect(psx);
+            } else {
+                psx->joy_phase++;
+            }
+        } else {
+            ack = 0;
+            psx_sio_deselect(psx);
+        }
+    } else if (psx->joy_cmd == 0x45u) {
+        static const u8 resp_digital[6] = { 0x01u, 0x02u, 0x00u, 0x02u, 0x00u, 0x00u };
+        static const u8 resp_analog[6]  = { 0x01u, 0x02u, 0x01u, 0x02u, 0x01u, 0x00u };
+        const u8 *resp = psx->joy_pad_analog ? resp_analog : resp_digital;
+        if (psx->joy_phase >= 2 && psx->joy_phase < 8) {
+            rx = resp[psx->joy_phase - 2u];
+            if (psx->joy_phase == 7) {
+                ack = 0;
+                psx_sio_deselect(psx);
+            } else {
+                psx->joy_phase++;
+            }
+        } else {
+            ack = 0;
+            psx_sio_deselect(psx);
+        }
+    } else if (psx->joy_cmd == 0x46u) {
+        static const u8 resp_a[6] = { 0x00u, 0x00u, 0x01u, 0x02u, 0x00u, 0x0Au };
+        static const u8 resp_b[6] = { 0x00u, 0x00u, 0x01u, 0x01u, 0x01u, 0x14u };
+        const u8 *resp = (tx == 0x01u) ? resp_b : resp_a;
+        if (psx->joy_phase == 2) {
+            psx->joy_mc_index = (tx == 0x01u) ? 1u : 0u;
+            rx = resp[0];
+            psx->joy_phase = 3;
+        } else if (psx->joy_phase >= 3 && psx->joy_phase < 8) {
+            resp = (psx->joy_mc_index == 1u) ? resp_b : resp_a;
+            rx = resp[psx->joy_phase - 2u];
+            if (psx->joy_phase == 7) {
+                ack = 0;
+                psx_sio_deselect(psx);
+            } else {
+                psx->joy_phase++;
+            }
+        } else {
+            ack = 0;
+            psx_sio_deselect(psx);
+        }
+    } else if (psx->joy_cmd == 0x47u) {
+        static const u8 resp[6] = { 0x00u, 0x00u, 0x02u, 0x00u, 0x01u, 0x00u };
+        if (psx->joy_phase >= 2 && psx->joy_phase < 8) {
+            rx = resp[psx->joy_phase - 2u];
+            if (psx->joy_phase == 7) {
+                ack = 0;
+                psx_sio_deselect(psx);
+            } else {
+                psx->joy_phase++;
+            }
+        } else {
+            ack = 0;
+            psx_sio_deselect(psx);
+        }
+    } else if (psx->joy_cmd == 0x48u) {
+        static const u8 resp[6] = { 0x00u, 0x00u, 0x00u, 0x00u, 0x01u, 0x00u };
+        if (psx->joy_phase >= 2 && psx->joy_phase < 8) {
+            rx = resp[psx->joy_phase - 2u];
+            if (psx->joy_phase == 7) {
+                ack = 0;
+                psx_sio_deselect(psx);
+            } else {
+                psx->joy_phase++;
+            }
+        } else {
+            ack = 0;
+            psx_sio_deselect(psx);
+        }
+    } else if (psx->joy_cmd == 0x4Cu) {
+        static const u8 resp[6] = { 0x00u, 0x00u, 0x00u, 0x04u, 0x00u, 0x00u };
+        if (psx->joy_phase >= 2 && psx->joy_phase < 8) {
+            rx = resp[psx->joy_phase - 2u];
+            if (psx->joy_phase == 7) {
+                ack = 0;
+                psx_sio_deselect(psx);
+            } else {
+                psx->joy_phase++;
+            }
+        } else {
+            ack = 0;
+            psx_sio_deselect(psx);
+        }
+    } else if (psx->joy_cmd == 0x4Du) {
+        static const u8 resp[6] = { 0x00u, 0x01u, 0xFFu, 0xFFu, 0xFFu, 0xFFu };
+        if (psx->joy_phase >= 2 && psx->joy_phase < 8) {
+            rx = resp[psx->joy_phase - 2u];
+            if (psx->joy_phase == 7) {
+                ack = 0;
+                psx_sio_deselect(psx);
+            } else {
+                psx->joy_phase++;
+            }
+        } else {
+            ack = 0;
+            psx_sio_deselect(psx);
+        }
+    } else if (psx->joy_cmd == 0x4Fu) {
+        static const u8 resp[6] = { 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u };
+        if (psx->joy_phase >= 2 && psx->joy_phase < 8) {
+            rx = resp[psx->joy_phase - 2u];
+            if (psx->joy_phase == 7) {
+                ack = 0;
+                psx_sio_deselect(psx);
+            } else {
+                psx->joy_phase++;
+            }
+        } else {
+            ack = 0;
+            psx_sio_deselect(psx);
+        }
     } else {
         ack = 0;
         psx_sio_deselect(psx);
     }
 
     psx_sio_finish_transfer(psx, rx, ack);
+}
+
+static u32 psx_gpu_vram_read_word(struct psx_system *psx)
+{
+    struct psx_gpu_io *g = &psx->gpu_io;
+    u32 out = g->gpuread;
+    u32 shift = 0;
+
+    if (!g->vramcpu_active || !g->vram)
+        return out;
+
+    out = 0;
+    for (u32 i = 0; i < 2; i++) {
+        u16 pix = g->vram[(g->vramcpu_cy & 0x1FFu) * 1024u + (g->vramcpu_cx & 0x3FFu)];
+        out |= ((u32)pix) << shift;
+        shift += 16;
+
+        g->vramcpu_cx++;
+        if (g->vramcpu_cx >= g->vramcpu_x + g->vramcpu_w) {
+            g->vramcpu_cx = g->vramcpu_x;
+            g->vramcpu_cy++;
+            if (g->vramcpu_cy >= g->vramcpu_y + g->vramcpu_h) {
+                g->vramcpu_active = 0;
+                break;
+            }
+        }
+    }
+
+    g->gpuread = out;
+    return out;
 }
 
 static void psx_sio_handle_memcard(struct psx_system *psx, u8 tx)
@@ -336,18 +661,89 @@ static u32 psx_sio_stat(const struct psx_system *psx)
 /* ── SPU Helpers ─────────────────────────────────────────────────── */
 static const s32 f1[] = { 0, 60, 115, 98, 122 };
 static const s32 f2[] = { 0, 0, -52, -55, -60 };
+static const s16 psx_spu_gauss[512] = {
+    -0x001, -0x001, -0x001, -0x001, -0x001, -0x001, -0x001, -0x001,
+    -0x001, -0x001, -0x001, -0x001, -0x001, -0x001, -0x001, -0x001,
+    0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x001,
+    0x001, 0x001, 0x001, 0x002, 0x002, 0x002, 0x003, 0x003,
+    0x003, 0x004, 0x004, 0x005, 0x005, 0x006, 0x007, 0x007,
+    0x008, 0x009, 0x009, 0x00A, 0x00B, 0x00C, 0x00D, 0x00E,
+    0x00F, 0x010, 0x011, 0x012, 0x013, 0x015, 0x016, 0x018,
+    0x019, 0x01B, 0x01C, 0x01E, 0x020, 0x021, 0x023, 0x025,
+    0x027, 0x029, 0x02C, 0x02E, 0x030, 0x033, 0x035, 0x038,
+    0x03A, 0x03D, 0x040, 0x043, 0x046, 0x049, 0x04D, 0x050,
+    0x054, 0x057, 0x05B, 0x05F, 0x063, 0x067, 0x06B, 0x06F,
+    0x074, 0x078, 0x07D, 0x082, 0x087, 0x08C, 0x091, 0x096,
+    0x09C, 0x0A1, 0x0A7, 0x0AD, 0x0B3, 0x0BA, 0x0C0, 0x0C7,
+    0x0CD, 0x0D4, 0x0DB, 0x0E3, 0x0EA, 0x0F2, 0x0FA, 0x101,
+    0x10A, 0x112, 0x11B, 0x123, 0x12C, 0x135, 0x13F, 0x148,
+    0x152, 0x15C, 0x166, 0x171, 0x17B, 0x186, 0x191, 0x19C,
+    0x1A8, 0x1B4, 0x1C0, 0x1CC, 0x1D9, 0x1E5, 0x1F2, 0x200,
+    0x20D, 0x21B, 0x229, 0x237, 0x246, 0x255, 0x264, 0x273,
+    0x283, 0x293, 0x2A3, 0x2B4, 0x2C4, 0x2D6, 0x2E7, 0x2F9,
+    0x30B, 0x31D, 0x330, 0x343, 0x356, 0x36A, 0x37E, 0x392,
+    0x3A7, 0x3BC, 0x3D1, 0x3E7, 0x3FC, 0x413, 0x42A, 0x441,
+    0x458, 0x470, 0x488, 0x4A0, 0x4B9, 0x4D2, 0x4EC, 0x506,
+    0x520, 0x53B, 0x556, 0x572, 0x58E, 0x5AA, 0x5C7, 0x5E4,
+    0x601, 0x61F, 0x63E, 0x65C, 0x67C, 0x69B, 0x6BB, 0x6DC,
+    0x6FD, 0x71E, 0x740, 0x762, 0x784, 0x7A7, 0x7CB, 0x7EF,
+    0x813, 0x838, 0x85D, 0x883, 0x8A9, 0x8D0, 0x8F7, 0x91E,
+    0x946, 0x96F, 0x998, 0x9C1, 0x9EB, 0xA16, 0xA40, 0xA6C,
+    0xA98, 0xAC4, 0xAF1, 0xB1E, 0xB4C, 0xB7A, 0xBA9, 0xBD8,
+    0xC07, 0xC38, 0xC68, 0xC99, 0xCCB, 0xCFD, 0xD30, 0xD63,
+    0xD97, 0xDCB, 0xE00, 0xE35, 0xE6B, 0xEA1, 0xED7, 0xF0F,
+    0xF46, 0xF7F, 0xFB7, 0xFF1, 0x102A, 0x1065, 0x109F, 0x10DB,
+    0x1116, 0x1153, 0x118F, 0x11CD, 0x120B, 0x1249, 0x1288, 0x12C7,
+    0x1307, 0x1347, 0x1388, 0x13C9, 0x140B, 0x144D, 0x1490, 0x14D4,
+    0x1517, 0x155C, 0x15A0, 0x15E6, 0x162C, 0x1672, 0x16B9, 0x1700,
+    0x1747, 0x1790, 0x17D8, 0x1821, 0x186B, 0x18B5, 0x1900, 0x194B,
+    0x1996, 0x19E2, 0x1A2E, 0x1A7B, 0x1AC8, 0x1B16, 0x1B64, 0x1BB3,
+    0x1C02, 0x1C51, 0x1CA1, 0x1CF1, 0x1D42, 0x1D93, 0x1DE5, 0x1E37,
+    0x1E89, 0x1EDC, 0x1F2F, 0x1F82, 0x1FD6, 0x202A, 0x207F, 0x20D4,
+    0x2129, 0x217F, 0x21D5, 0x222C, 0x2282, 0x22DA, 0x2331, 0x2389,
+    0x23E1, 0x2439, 0x2492, 0x24EB, 0x2545, 0x259E, 0x25F8, 0x2653,
+    0x26AD, 0x2708, 0x2763, 0x27BE, 0x281A, 0x2876, 0x28D2, 0x292E,
+    0x298B, 0x29E7, 0x2A44, 0x2AA1, 0x2AFF, 0x2B5C, 0x2BBA, 0x2C18,
+    0x2C76, 0x2CD4, 0x2D33, 0x2D91, 0x2DF0, 0x2E4F, 0x2EAE, 0x2F0D,
+    0x2F6C, 0x2FCC, 0x302B, 0x308B, 0x30EA, 0x314A, 0x31AA, 0x3209,
+    0x3269, 0x32C9, 0x3329, 0x3389, 0x33E9, 0x3449, 0x34A9, 0x3509,
+    0x3569, 0x35C9, 0x3629, 0x3689, 0x36E8, 0x3748, 0x37A8, 0x3807,
+    0x3867, 0x38C6, 0x3926, 0x3985, 0x39E4, 0x3A43, 0x3AA2, 0x3B00,
+    0x3B5F, 0x3BBD, 0x3C1B, 0x3C79, 0x3CD7, 0x3D35, 0x3D92, 0x3DEF,
+    0x3E4C, 0x3EA9, 0x3F05, 0x3F62, 0x3FBD, 0x4019, 0x4074, 0x40D0,
+    0x412A, 0x4185, 0x41DF, 0x4239, 0x4292, 0x42EB, 0x4344, 0x439C,
+    0x43F4, 0x444C, 0x44A3, 0x44FA, 0x4550, 0x45A6, 0x45FC, 0x4651,
+    0x46A6, 0x46FA, 0x474E, 0x47A1, 0x47F4, 0x4846, 0x4898, 0x48E9,
+    0x493A, 0x498A, 0x49D9, 0x4A29, 0x4A77, 0x4AC5, 0x4B13, 0x4B5F,
+    0x4BAC, 0x4BF7, 0x4C42, 0x4C8D, 0x4CD7, 0x4D20, 0x4D68, 0x4DB0,
+    0x4DF7, 0x4E3E, 0x4E84, 0x4EC9, 0x4F0E, 0x4F52, 0x4F95, 0x4FD7,
+    0x5019, 0x505A, 0x509A, 0x50DA, 0x5118, 0x5156, 0x5194, 0x51D0,
+    0x520C, 0x5247, 0x5281, 0x52BA, 0x52F3, 0x532A, 0x5361, 0x5397,
+    0x53CC, 0x5401, 0x5434, 0x5467, 0x5499, 0x54CA, 0x54FA, 0x5529,
+    0x5558, 0x5585, 0x55B2, 0x55DE, 0x5609, 0x5632, 0x565B, 0x5684,
+    0x56AB, 0x56D1, 0x56F6, 0x571B, 0x573E, 0x5761, 0x5782, 0x57A3,
+    0x57C3, 0x57E2, 0x57FF, 0x581C, 0x5838, 0x5853, 0x586D, 0x5886,
+    0x589E, 0x58B5, 0x58CB, 0x58E0, 0x58F4, 0x5907, 0x5919, 0x592A,
+    0x593A, 0x5949, 0x5958, 0x5965, 0x5971, 0x597C, 0x5986, 0x598F,
+    0x5997, 0x599E, 0x59A4, 0x59A9, 0x59AD, 0x59B0, 0x59B2, 0x59B3
+};
 
 static void psx_spu_decode_block(struct psx_system *psx, int v) {
     u32 addr = psx->spu_voice_addr[v] & 0x7FFFFu;
     u8 head = psx->spu_ram[addr];
-    int shift = 12 - (head & 0xFu);
-    int filter = (head >> 4) & 0x7u;
-    if (filter > 4) filter = 4; /* Clamp to 0..4 */
+    /* PSX ADPCM block header byte: bits[3:0]=shift, bits[5:4]=filter (0-3)
+     * No$PSX: shift > 12 is "garbage" - clamp to 0 (no shift = use 12-bit raw)  */
+    int raw_shift = (int)(head & 0xFu);
+    int shift = (raw_shift > 12) ? 9 : (12 - raw_shift);
+    int filter = (head >> 4) & 0x3u;  /* 2-bit filter index, range 0-3 */
 
     s32 b1 = f1[filter];
     s32 b2 = f2[filter];
     s32 s1 = psx->spu_voice_last[v][0];
     s32 s2 = psx->spu_voice_last[v][1];
+    psx->spu_voice_prev[v][0] = psx->spu_voice_samples[v][25];
+    psx->spu_voice_prev[v][1] = psx->spu_voice_samples[v][26];
+    psx->spu_voice_prev[v][2] = psx->spu_voice_samples[v][27];
 
     for (int i = 0; i < 28; i++) {
         u8 byte = psx->spu_ram[addr + 2 + (i >> 1)];
@@ -363,6 +759,46 @@ static void psx_spu_decode_block(struct psx_system *psx, int v) {
     }
     psx->spu_voice_last[v][0] = (s16)s1;
     psx->spu_voice_last[v][1] = (s16)s2;
+}
+
+static void psx_spu_key_on_mask(struct psx_system *psx, u32 mask)
+{
+    mask &= 0x00FFFFFFu;
+    psx->spu_voice_on |= mask;
+    psx->spu_endx &= ~mask;
+
+    for (int v = 0; v < 24; v++) {
+        if (!(mask & (1u << v)))
+            continue;
+
+        u32 sa = ((u32)psx->spu_regs[v * 8 + 3] << 3) & 0x7FFFFu;
+        psx->spu_voice_addr[v] = sa;
+        psx->spu_voice_idx[v] = 0;
+        psx->spu_voice_phase[v] = 0;
+        psx->spu_voice_last[v][0] = 0;
+        psx->spu_voice_last[v][1] = 0;
+        psx->spu_voice_prev[v][0] = 0;
+        psx->spu_voice_prev[v][1] = 0;
+        psx->spu_voice_prev[v][2] = 0;
+        for (u32 i = 0; i < 28u; i++)
+            psx->spu_voice_samples[v][i] = 0;
+        psx->spu_adsr_vol[v] = 0;
+        psx->spu_adsr_phase[v] = 0;
+        psx->spu_adsr_cnt[v] = 0;
+        psx->spu_regs[v * 8 + 6] = 0;
+        psx_spu_decode_block(psx, v);
+    }
+}
+
+static void psx_spu_key_off_mask(struct psx_system *psx, u32 mask)
+{
+    mask &= 0x00FFFFFFu;
+    for (int v = 0; v < 24; v++) {
+        if ((mask & (1u << v)) && (psx->spu_voice_on & (1u << v))) {
+            psx->spu_adsr_phase[v] = 3;
+            psx->spu_adsr_cnt[v] = 0;
+        }
+    }
 }
 
 /* kseg0 / kseg1 → physical address */
@@ -403,24 +839,42 @@ static void psx_lba_to_msf(u32 lba, u8 *m, u8 *s, u8 *f)
 static void psx_cd_get_subheader(const struct psx_system *psx,
                                  u8 *file, u8 *channel, u8 *submode, u8 *coding)
 {
-    if (psx->cd_sector_size == 2352u && psx->cd_sector_buf[15] == 2u) {
-        if (file) *file = psx->cd_sector_buf[16];
+    /* Works for both RAW (2352) sectors with Mode 2 header and for
+     * synthetic sectors built from ISO 2048 images (buf[15]==2 set by reader). */
+    if (psx->cd_sector_buf[15] == 2u) {
+        if (file)    *file    = psx->cd_sector_buf[16];
         if (channel) *channel = psx->cd_sector_buf[17] & 0x1Fu;
         if (submode) *submode = psx->cd_sector_buf[18];
-        if (coding) *coding = psx->cd_sector_buf[19];
+        if (coding)  *coding  = psx->cd_sector_buf[19];
     } else {
-        if (file) *file = 0;
+        if (file)    *file    = 0;
         if (channel) *channel = 0;
-        if (submode) *submode = 0x08u;
-        if (coding) *coding = 0x00u;
+        if (submode) *submode = 0x08u; /* Data, not real-time */
+        if (coding)  *coding  = 0x00u;
     }
 }
 
+/* Returns 1 if the current sector is an XA audio sector that should be
+ * routed to the XA/SPU path and NOT fed to the CPU data FIFO.
+ * Respects the SetFilter file/channel set by the game (cmd 0x44). */
 static int psx_cd_is_xa_audio_rt(const struct psx_system *psx)
 {
-    u8 submode = 0;
-    psx_cd_get_subheader(psx, 0, 0, &submode, 0);
-    return ((submode & 0x44u) == 0x44u);
+    u8 file = 0, channel = 0, submode = 0;
+    psx_cd_get_subheader(psx, &file, &channel, &submode, 0);
+
+    /* Must be real-time (0x40) AND audio (0x04) */
+    if ((submode & 0x44u) != 0x44u)
+        return 0;
+
+    /* If XA filter is active (cd_mode bit 3), apply file+channel filter.
+     * Only route to audio if it matches what the game asked for. */
+    if (psx->cd_mode & 0x08u) {
+        if (file != (u8)psx->cd_filter_file)
+            return 0;
+        if (channel != (u8)psx->cd_filter_channel)
+            return 0;
+    }
+    return 1;
 }
 
 static u8 psx_cd_stat(struct psx_system *psx)
@@ -598,6 +1052,11 @@ static void psx_cd_exec_cmd(struct psx_system *psx, u32 cmd)
         psx->cd_setloc_pending = 1;
         resp[0] = stat;
         psx_cd_set_resp(psx, 3u, resp, 1);
+    } else if (cmd == 0x44) { /* SetFilter: select XA file+channel for interleave */
+        psx->cd_filter_file    = psx->cd_bcd[0];
+        psx->cd_filter_channel = psx->cd_bcd[1];
+        resp[0] = stat;
+        psx_cd_set_resp(psx, 3u, resp, 1);
     } else if (cmd == 0x06 || cmd == 0x1Bu || cmd == 0x1Cu) { /* ReadN / ReadS */
         psx->cd_read_cmd = cmd;
         psx_cd_fifo_reset(psx);
@@ -752,11 +1211,13 @@ static void psx_cd_exec_cmd(struct psx_system *psx, u32 cmd)
 
 static u32 psx_cd_data_skip(const struct psx_system *psx)
 {
-    /* SetMode.bit5 selects sector size:
-     *   0 = 0x800 data-only  -> payload starts at +24
-     *   1 = 0x924 whole sector except 12-byte sync -> starts at +12
-     * The BIOS/game sequence uses SetMode A0h, so honoring bit5 matters. */
+    /* SetMode.bit4/bit5 sector delivery:
+     *   bit4=1         -> 0x918 bytes (2328), payload starts at +24
+     *   bit4=0 bit5=1  -> 0x924 bytes (2340), payload starts at +12
+     *   bit4=0 bit5=0  -> 0x800 bytes (2048), payload starts at +24
+     * See psx-spx CdAsyncReadSector / SetMode notes. */
     if (psx->cd_sector_size == 2352) {
+        if (psx->cd_mode & 0x10u) return 24u;
         if (psx->cd_mode & 0x20u) return 12u;
         return 24u;
     }
@@ -766,6 +1227,7 @@ static u32 psx_cd_data_skip(const struct psx_system *psx)
 static u32 psx_cd_data_limit(const struct psx_system *psx)
 {
     if (psx->cd_sector_size == 2352) {
+        if (psx->cd_mode & 0x10u) return 2328u;
         if (psx->cd_mode & 0x20u) return 2340u;
         return 2048u;
     }
@@ -790,7 +1252,7 @@ static void psx_cd_fifo_sync_state(struct psx_system *psx)
     }
 
     psx->cd_data_ready = 1;
-    psx->cd_data_pos = psx->cd_fifo_pos[psx->cd_fifo_r & 7u];
+    psx->cd_data_pos = psx->cd_fifo_pos[psx->cd_fifo_r & PSX_CD_FIFO_MASK];
 }
 
 static void psx_cd_fifo_push(struct psx_system *psx, const u8 *src, u32 size)
@@ -802,17 +1264,17 @@ static void psx_cd_fifo_push(struct psx_system *psx, const u8 *src, u32 size)
     if (size > 2340u)
         size = 2340u;
 
-    if (psx->cd_fifo_count >= 8u) {
-        psx->cd_fifo_r = (psx->cd_fifo_r + 1u) & 7u;
+    if (psx->cd_fifo_count >= PSX_CD_FIFO_CAP) {
+        psx->cd_fifo_r = (psx->cd_fifo_r + 1u) & PSX_CD_FIFO_MASK;
         psx->cd_fifo_count--;
     }
 
-    idx = psx->cd_fifo_w & 7u;
+    idx = psx->cd_fifo_w & PSX_CD_FIFO_MASK;
     for (u32 i = 0; i < size; i++)
         psx->cd_fifo_data[idx][i] = src[i];
     psx->cd_fifo_size[idx] = (u16)size;
     psx->cd_fifo_pos[idx] = 0;
-    psx->cd_fifo_w = (psx->cd_fifo_w + 1u) & 7u;
+    psx->cd_fifo_w = (psx->cd_fifo_w + 1u) & PSX_CD_FIFO_MASK;
     psx->cd_fifo_count++;
     psx_cd_fifo_sync_state(psx);
 }
@@ -835,14 +1297,14 @@ static u8 psx_cd_fifo_read_byte(struct psx_system *psx, int *ok)
         return 0;
     }
 
-    idx = psx->cd_fifo_r & 7u;
+    idx = psx->cd_fifo_r & PSX_CD_FIFO_MASK;
     if (psx->cd_fifo_pos[idx] >= psx->cd_fifo_size[idx]) {
-        psx->cd_fifo_r = (psx->cd_fifo_r + 1u) & 7u;
+        psx->cd_fifo_r = (psx->cd_fifo_r + 1u) & PSX_CD_FIFO_MASK;
         psx->cd_fifo_count--;
         psx_cd_fifo_sync_state(psx);
         if (psx->cd_fifo_count == 0u)
             return 0;
-        idx = psx->cd_fifo_r & 7u;
+        idx = psx->cd_fifo_r & PSX_CD_FIFO_MASK;
     }
 
     value = psx->cd_fifo_data[idx][psx->cd_fifo_pos[idx]++];
@@ -850,7 +1312,7 @@ static u8 psx_cd_fifo_read_byte(struct psx_system *psx, int *ok)
         *ok = 1;
 
     if (psx->cd_fifo_pos[idx] >= psx->cd_fifo_size[idx]) {
-        psx->cd_fifo_r = (psx->cd_fifo_r + 1u) & 7u;
+        psx->cd_fifo_r = (psx->cd_fifo_r + 1u) & PSX_CD_FIFO_MASK;
         psx->cd_fifo_count--;
     }
     psx_cd_fifo_sync_state(psx);
@@ -880,30 +1342,30 @@ static void psx_dma_complete_channel(struct psx_system *psx, u32 ch)
 
 static void psx_spu_refresh_stat(struct psx_system *psx, int transfer_busy)
 {
-    u16 cnt = psx->spu_regs[0xD5];
+    u16 cnt = psx->spu_regs[SPU_REG_CTRL];
     u16 stat = cnt & 0x003Fu;
     u16 mode = (cnt >> 4) & 3u;
     if (transfer_busy) stat |= 0x0400u;
     if (mode == 2u) stat |= 0x0180u; /* DMA write request */
     else if (mode == 3u) stat |= 0x0280u; /* DMA read request */
-    if (psx->spu_regs[0xD3] & 0x0040u) stat |= 0x0040u; /* IRQ9 flag */
-    psx->spu_regs[0xD3] = stat;
+    if (psx->spu_regs[SPU_REG_STAT] & 0x0040u) stat |= 0x0040u; /* IRQ9 flag */
+    psx->spu_regs[SPU_REG_STAT] = stat;
 }
 
 static void psx_spu_raise_irq9(struct psx_system *psx)
 {
-    if (!(psx->spu_regs[0xD5] & 0x8000u)) return;
-    if (!(psx->spu_regs[0xD5] & 0x0040u)) return;
-    psx->spu_regs[0xD3] |= 0x0040u;
+    if (!(psx->spu_regs[SPU_REG_CTRL] & 0x8000u)) return;
+    if (!(psx->spu_regs[SPU_REG_CTRL] & 0x0040u)) return;
+    psx->spu_regs[SPU_REG_STAT] |= 0x0040u;
     psx_spu_refresh_stat(psx, 0);
     psx->i_stat |= (1u << 9);
 }
 
 static void psx_spu_check_transfer_irq(struct psx_system *psx, u32 start_addr, u32 bytes)
 {
-    u32 irq_addr = ((u32)psx->spu_regs[0xD2] << 3) & 0x7FFFFu;
+    u32 irq_addr = ((u32)psx->spu_regs[SPU_REG_IRQ_ADDR] << 3) & 0x7FFFFu;
     if (!bytes) return;
-    if (!(psx->spu_regs[0xD5] & 0x0040u) || !(psx->spu_regs[0xD5] & 0x8000u))
+    if (!(psx->spu_regs[SPU_REG_CTRL] & 0x0040u) || !(psx->spu_regs[SPU_REG_CTRL] & 0x8000u))
         return;
 
     for (u32 i = 0; i < bytes; i++) {
@@ -978,15 +1440,25 @@ static void psx_mdec_init_defaults(struct psx_system *psx)
 
 static void psx_mdec_update_status(struct psx_system *psx)
 {
+    /* Reconstruct MDEC status register per psx-spx:
+     *  Bit 31: Data-Out FIFO Empty  (1 = empty, no output ready)
+     *  Bit 30: Data-In FIFO Full    (1 = full, stop sending)
+     *  Bit 29: Command Busy         (1 = actively processing / receiving words)
+     *  Bit 28: Data-In DMA enable   (mirrors ctrl bit)
+     *  Bit 27: Data-Out DMA enable  (mirrors ctrl bit, only set when output ready)
+     *  Bits 26-23: mirror CMD bits 28-25
+     *  Bits 15-0: number of remaining parameter words - 1 (0xFFFF when idle) */
     u32 st = 0;
     u32 remaining = psx->mdec_words_remaining;
 
     if (!psx->mdec_output_ready)
-        st |= 1u << 31; /* data-out fifo empty */
-    if (remaining == 0)
-        st |= 1u << 30; /* data-in full/last word received */
+        st |= 1u << 31; /* Data-Out FIFO Empty */
+    /* Bit 30: Data-In FIFO Full — set when we still need to receive words */
     if (remaining != 0)
-        st |= 1u << 29; /* busy receiving parameters */
+        st |= 1u << 30;
+    /* Bit 29: Busy — set while actively receiving parameter words OR output pending */
+    if (remaining != 0 || psx->mdec_output_ready)
+        st |= 1u << 29;
     if (psx->mdec_in_enabled)
         st |= 1u << 28;
     if (psx->mdec_out_enabled && psx->mdec_output_ready)
@@ -1043,18 +1515,31 @@ static void psx_mdec_write_command(struct psx_system *psx, u32 val)
         psx->mdec_output_ready = 0;
         psx->mdec_output_words = 0;
         psx->mdec_data_read_pos = 0;
-        if (!(psx->mdec_log_flags & 1u) && psx->sendto_fn && psx->log_fd >= 0) {
-            psx->mdec_log_flags |= 1u;
-            psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr, "[MDEC] cmd=", val);
-            psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr, "[MDEC] words=", psx->mdec_words_remaining);
+        /* Log each command type with separate flag bits:
+         * bit 0x01 = first CMD2/3 (table load) seen
+         * bit 0x10 = first CMD1 (decode) seen
+         * bit 0x02 = DMA0 seen (used in dma0_exec)
+         * bit 0x04 = DMA1 seen (used in dma1_exec) */
+        if (cmd == 1u) {
+            if (!(psx->mdec_log_flags & 0x10u) && psx->sendto_fn && psx->log_fd >= 0) {
+                psx->mdec_log_flags |= 0x10u;
+                psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr, "[MDEC] CMD1 decode=", val);
+                psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr, "[MDEC] CMD1 depth=", (val >> 27) & 3u);
+                psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr, "[MDEC] CMD1 words=", psx->mdec_words_remaining);
+            }
+        } else {
+            if (!(psx->mdec_log_flags & 1u) && psx->sendto_fn && psx->log_fd >= 0) {
+                psx->mdec_log_flags |= 1u;
+                psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr, "[MDEC] cmd=", val);
+                psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr, "[MDEC] words=", psx->mdec_words_remaining);
+            }
         }
     } else {
         psx->mdec_words_remaining--;
-        if (psx->mdec_words_remaining == 0 && ((psx->mdec_cmd >> 29) == 1u)) {
-            /* Minimal stub: decoded data becomes available as black blocks. */
-            psx->mdec_output_ready = 1;
-            psx->mdec_data_read_pos = 0;
-        }
+        /* For CMD 1 (decode macroblocks): output becomes available only after
+         * DMA1 explicitly requests it. Do NOT set output_ready here — the
+         * actual decode+write happens in dma1_exec when the game pulls data.
+         * For CMD 2/3 (load tables): also handled in dma0_exec after all words. */
     }
     psx_mdec_update_status(psx);
 }
@@ -1211,7 +1696,7 @@ static void psx_mdec_decode_colored_macroblock(struct psx_system *psx, u8 *out, 
             s32 cr = crblk[(py >> 1) * 8u + (px >> 1)];
             s32 cb = cbblk[(py >> 1) * 8u + (px >> 1)];
             s32 r = yv + (((359 * cr) + 0x80) >> 8);
-            s32 g = yv + ((((-88 * cb) & ~0x1F) + ((-183 * cr) & ~0x07) + 0x80) >> 8);
+            s32 g = yv - (((88 * cb) + (183 * cr) + 0x80) >> 8);
             s32 b = yv + (((454 * cb) + 0x80) >> 8);
             u8 pr = psx_mdec_pack_component(r, signed_output);
             u8 pg = psx_mdec_pack_component(g, signed_output);
@@ -1318,8 +1803,14 @@ static void dma0_exec(struct psx_system *psx)
         if (addr + 3u < RAM_SIZE) {
             u32 data = *(u32 *)(psx->ram + addr);
             u32 is_command_word = (psx->mdec_words_remaining == 0u);
-            if (!is_command_word && psx->mdec_in_word_count < 0x10000u)
+            if (is_command_word) {
+                /* New command: reset input accumulator so previous macroblock
+                 * data doesn't bleed into the next decode. */
+                psx->mdec_in_word_count = 0;
+                psx->mdec_in_half_pos   = 0;
+            } else if (psx->mdec_in_word_count < 0x10000u) {
                 psx->mdec_in_words[psx->mdec_in_word_count++] = data;
+            }
             psx_mdec_write_command(psx, data);
         }
         addr = (addr + 4u) & 0x1FFFFFu;
@@ -1329,6 +1820,13 @@ static void dma0_exec(struct psx_system *psx)
         psx_mdec_commit_iq_table(psx);
     else if ((psx->mdec_cmd >> 29) == 3u)
         psx_mdec_commit_scale_table(psx);
+
+    /* After loading all payload words for a CMD1 (decode), mark output
+     * ready so DMA1 knows it can start pulling decoded macroblocks. */
+    if ((psx->mdec_cmd >> 29) == 1u && psx->mdec_words_remaining == 0u) {
+        psx->mdec_output_ready  = 1;
+        psx->mdec_data_read_pos = 0;
+    }
 
     psx->dma_madr[0] = addr;
     psx_dma_complete_channel(psx, 0u);
@@ -1351,6 +1849,8 @@ static void dma1_exec(struct psx_system *psx)
         psx->mdec_log_flags |= 4u;
         psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr, "[MDEC] DMA1 bcr=", psx->dma_bcr[1]);
         psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr, "[MDEC] DMA1 chcr=", psx->dma_chcr[1]);
+        psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr, "[MDEC] DMA1 madr=", psx->dma_madr[1]);
+        psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr, "[MDEC] in_words=", psx->mdec_in_word_count);
     }
 
     if ((psx->mdec_cmd >> 29) == 1u) {
@@ -1542,7 +2042,7 @@ u32 psx_bus_read(struct psx_system *psx, u32 addr, int width)
             psx_mdec_update_status(psx);
             return psx->mdec_status;
         /* GPU */
-        case 0x1F801810: return psx->gpu_io.gpuread;
+        case 0x1F801810: return psx_gpu_vram_read_word(psx);
         case 0x1F801814: return psx->gpu_io.gpustat;
         /* CD-ROM: 1F801800 - 1F801803 */
         case 0x1F801800: return psx_cd_hsts(psx);
@@ -1610,8 +2110,10 @@ u32 psx_bus_read(struct psx_system *psx, u32 addr, int width)
         case 0x1F8010F0: return 0x07654321u; /* DPCR – all channels enabled */
         case 0x1F8010F4: return psx->dma_dicr;
         /* SPU */
-        case 0x1F801DA6: return psx->spu_regs[0xD3]; /* SPUSTAT */
-        case 0x1F801DAA: return psx->spu_regs[0xD5]; /* SPUCNT */
+        case 0x1F801DAA: return psx->spu_regs[SPU_REG_CTRL]; /* SPUCNT */
+        case 0x1F801DAE: return psx->spu_regs[SPU_REG_STAT]; /* SPUSTAT */
+        case 0x1F801D9C: return psx->spu_endx & 0x00FFFFFFu; /* ENDX */
+        case 0x1F801D9E: return (psx->spu_endx >> 16) & 0x00FFu; /* ENDX hi */
         default:
             if (phys >= 0x1F801C00 && phys < 0x1F801E00) {
                 return psx->spu_regs[(phys - 0x1F801C00) >> 1];
@@ -1817,6 +2319,18 @@ void psx_bus_write(struct psx_system *psx, u32 addr, u32 val, int width)
                 words *= blocks;
                 u32 spu_addr = psx->spu_addr_internal & 0x7FFFFu;
                 u32 spu_start = spu_addr;
+                /* Log first DMA4 transfer: SPU dest, RAM src, first word of data */
+                {
+                    u32 _first = (addr + 3u < RAM_SIZE) ? *(u32*)(psx->ram + addr) : 0u;
+                    psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
+                               "[DMA4] spuDst=", spu_addr);
+                    psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
+                               "[DMA4] ramSrc=", addr);
+                    psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
+                               "[DMA4] data0=", _first);
+                    psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
+                               "[DMA4] words=", words);
+                }
                 psx_spu_refresh_stat(psx, 1);
                 for (u32 i = 0; i < words; i++) {
                     if (addr + 3u < RAM_SIZE) {
@@ -1830,7 +2344,7 @@ void psx_bus_write(struct psx_system *psx, u32 addr, u32 val, int width)
                     addr = (addr + 4) & 0x1FFFFCu;
                 }
                 psx->spu_addr_internal = spu_addr;
-                psx->spu_regs[0xD1] = (u16)(spu_addr >> 3);
+                psx->spu_regs[SPU_REG_TRANSFER_ADDR] = (u16)(spu_addr >> 3);
                 psx_spu_check_transfer_irq(psx, spu_start, words * 4u);
                 psx_spu_refresh_stat(psx, 0);
                 psx_dma_complete_channel(psx, 4u);
@@ -1848,40 +2362,24 @@ void psx_bus_write(struct psx_system *psx, u32 addr, u32 val, int width)
             psx->dma_dicr = (psx->dma_dicr & 0xFF00FFFFu) | (val & 0x00FF8000u);
             psx_dma_recalc_dicr(psx);
             break;
-        case 0x1F801D88: /* Key On (0-15) */
-            psx->spu_voice_on |= (val & 0xFFFFu);
-            for (int v = 0; v < 16; v++) {
-                if (val & (1u << v)) {
-                    psx->spu_voice_addr[v] = (psx->spu_regs[v*8 + 3] << 3) & 0x7FFFFu;
-                    psx->spu_voice_idx[v] = 0;
-                    psx->spu_voice_phase[v] = 0;
-                    psx->spu_voice_last[v][0] = 0;
-                    psx->spu_voice_last[v][1] = 0;
-                    psx_spu_decode_block(psx, v);
-                }
-            }
+        case 0x1F801D88: /* Key On (0-23) */
+            psx_spu_key_on_mask(psx, val);
+            if (width == 4)
+                psx->spu_regs[((0x1F801D8A - 0x1F801C00) >> 1)] = (u16)(val >> 16);
             break;
         case 0x1F801D8A: /* Key On (16-23) */
-            psx->spu_voice_on |= ((val & 0xFFu) << 16);
-            for (int v = 0; v < 8; v++) {
-                if (val & (1u << v)) {
-                    psx->spu_voice_addr[v+16] = (psx->spu_regs[(v+16)*8 + 3] << 3) & 0x7FFFFu;
-                    psx->spu_voice_idx[v+16] = 0;
-                    psx->spu_voice_phase[v+16] = 0;
-                    psx->spu_voice_last[v+16][0] = 0;
-                    psx->spu_voice_last[v+16][1] = 0;
-                    psx_spu_decode_block(psx, v+16);
-                }
-            }
+            psx_spu_key_on_mask(psx, (val & 0xFFu) << 16);
             break;
-        case 0x1F801D8C: /* Key Off (0-15) */
-            psx->spu_voice_on &= ~(val & 0xFFFFu);
+        case 0x1F801D8C: /* Key Off (0-15): trigger release phase */
+            psx_spu_key_off_mask(psx, val);
+            if (width == 4)
+                psx->spu_regs[((0x1F801D8E - 0x1F801C00) >> 1)] = (u16)(val >> 16);
             break;
-        case 0x1F801D8E: /* Key Off (16-23) */
-            psx->spu_voice_on &= ~((val & 0xFFu) << 16);
+        case 0x1F801D8E: /* Key Off (16-23): trigger release phase */
+            psx_spu_key_off_mask(psx, (val & 0xFFu) << 16);
             break;
-        case 0x1F801DA2: /* SPU Transfer Address */
-            psx->spu_regs[0xD1] = (u16)val;
+        case 0x1F801DA6: /* SPU Transfer Address */
+            psx->spu_regs[SPU_REG_TRANSFER_ADDR] = (u16)val;
             psx->spu_addr_internal = (u32)val << 3;
             break;
         case 0x1F801DA8: { /* SPU RAM Transfer */
@@ -1889,18 +2387,22 @@ void psx_bus_write(struct psx_system *psx, u32 addr, u32 val, int width)
             psx->spu_ram[addr] = val & 0xFFu;
             psx->spu_ram[addr+1] = (val >> 8) & 0xFFu;
             psx->spu_addr_internal = (addr + 2) & 0x7FFFFu;
-            psx->spu_regs[0xD1] = (u16)(psx->spu_addr_internal >> 3);
+            psx->spu_regs[SPU_REG_TRANSFER_ADDR] = (u16)(psx->spu_addr_internal >> 3);
             break;
         }
         case 0x1F801DAA: /* SPUCNT */
-            psx->spu_regs[0xD5] = (u16)val;
+            psx->spu_regs[SPU_REG_CTRL] = (u16)val;
             if (!(val & 0x0040u))
-                psx->spu_regs[0xD3] &= ~0x0040u; /* bit6=0 also acknowledges IRQ9 */
+                psx->spu_regs[SPU_REG_STAT] &= ~0x0040u; /* bit6=0 also acknowledges IRQ9 */
             psx_spu_refresh_stat(psx, 0);
             break;
         default:
             if (phys >= 0x1F801C00 && phys < 0x1F801E00) {
-                psx->spu_regs[(phys - 0x1F801C00) >> 1] = (u16)val;
+                u32 _idx = (phys - 0x1F801C00) >> 1;
+                psx->spu_regs[_idx] = (u16)val;
+                /* 32-bit writes cover two consecutive 16-bit SPU registers */
+                if (width == 4 && _idx + 1 < 256u)
+                    psx->spu_regs[_idx + 1] = (u16)(val >> 16);
             }
             break;
         }
@@ -1989,6 +2491,15 @@ void psx_bus_tick(struct psx_system *psx, u32 cycles)
                     for(int k=16; k<24; k++) buf[k] = 0;
                     NC(psx->G, psx->kread_fn, (u64)psx->cd_fd, (u64)(buf + 24), 2048, 0, 0, 0);
                     for(int k=2072; k<2352; k++) buf[k] = 0;
+                } else if (sec_size == 2336) {
+                    u8 mm, ss, ff;
+                    buf[0] = 0x00; for(int k=1; k<11; k++) buf[k] = 0xFF; buf[11] = 0x00;
+                    psx_lba_to_msf(lba, &mm, &ss, &ff);
+                    buf[12] = mm; buf[13] = ss; buf[14] = ff;
+                    buf[15] = 0x02;
+                    if ((s32)NC(psx->G, psx->kread_fn, (u64)psx->cd_fd, (u64)(buf + 16), 2336, 0, 0, 0) != 2336) {
+                        for(int k=16; k<2352; k++) buf[k] = 0;
+                    }
                 } else {
                     NC(psx->G, psx->kread_fn, (u64)psx->cd_fd, (u64)buf, 2352, 0, 0, 0);
                 }
@@ -2045,9 +2556,10 @@ void psx_bus_tick(struct psx_system *psx, u32 cycles)
 static void psx_bus_vblank(struct psx_system *psx)
 {
     psx->i_stat |= 1u;  /* VBLANK (bit 0) */
+    psx_pad_update_bios_buffers(psx);
 
     /* Update SPU status bit */
-    psx->spu_regs[0xD3] |= 0x400; 
+    psx->spu_regs[SPU_REG_STAT] |= 0x400; 
 
     psx->gpu_io.gpustat ^= 0x80000000u;
 }
@@ -2057,65 +2569,287 @@ u32  psx_bus_read32 (struct psx_system *p, u32 a)      { return psx_bus_read(p, 
 void psx_bus_write32(struct psx_system *p, u32 a, u32 v){ psx_bus_write(p, a, v, 4); }
 
 
-void psx_spu_render(struct psx_system *psx, s16 *out, u32 count) {
-    u16 spucnt = psx->spu_regs[0xD5];
-    /* Master enable bit 15 (1=On), Mute bit 14 (0=Mute, 1=Unmute) */
-    if (!(spucnt & 0x8000) || !(spucnt & 0x4000)) {
-        if (!out) return;
-        for (u32 i = 0; i < count * 2; i++) out[i] = 0;
+/* Fixed-volume mode stores a signed 15-bit value which represents volume/2. */
+static s32 spu_fixed_volume(u16 reg)
+{
+    u32 raw = reg & 0x7FFFu;
+    return (s32)(((s32)(raw << 17)) >> 16);
+}
+
+static void spu_envelope_step(s32 *level, u32 *counter, u32 shift, u32 step,
+                              int exponential, int decreasing, int phase_negative,
+                              int decay_release_mode)
+{
+    s32 env = *level;
+    u32 cnt = *counter & 0x7FFFu;
+    s32 env_step = 7 - (s32)(step & 3u);
+    u32 counter_inc;
+    int all_bits;
+
+    if (decreasing ^ phase_negative)
+        env_step = ~env_step;
+
+    if (shift < 11u)
+        env_step <<= (11u - shift);
+
+    counter_inc = (shift > 11u) ? (0x8000u >> (shift - 11u)) : 0x8000u;
+
+    if (exponential && !decreasing && env > 0x6000) {
+        if (shift < 10u) {
+            env_step >>= 2;
+        } else if (shift >= 11u) {
+            counter_inc >>= 2;
+        } else {
+            env_step >>= 2;
+            counter_inc >>= 2;
+        }
+    } else if (exponential && decreasing) {
+        env_step = (env_step * env) / 0x8000;
+    }
+
+    all_bits = decay_release_mode ? (shift == 0x1Fu) : (((step & 3u) | (shift << 2)) == 0x7Fu);
+    if (!all_bits && counter_inc == 0u)
+        counter_inc = 1u;
+
+    cnt += counter_inc;
+    if ((cnt & 0x8000u) == 0u) {
+        *counter = cnt;
         return;
     }
 
-    s32 master_l = (s16)psx->spu_regs[0xC0];
-    s32 master_r = (s16)psx->spu_regs[0xC1];
+    cnt &= 0x7FFFu;
+    env += env_step;
+
+    if (!decreasing) {
+        if (env < -0x8000)
+            env = -0x8000;
+        else if (env > 0x7FFF)
+            env = 0x7FFF;
+    } else if (phase_negative) {
+        if (env < -0x8000)
+            env = -0x8000;
+        else if (env > 0)
+            env = 0;
+    } else if (env < 0) {
+        env = 0;
+    }
+
+    *level = env;
+    *counter = cnt;
+}
+
+static void spu_volume_tick(u16 reg, s32 *level, u32 *counter)
+{
+    if (!(reg & 0x8000u)) {
+        *level = spu_fixed_volume(reg);
+        *counter = 0;
+        return;
+    }
+
+    spu_envelope_step(level, counter,
+                      (reg >> 2) & 0x1Fu,
+                      reg & 0x3u,
+                      (reg >> 14) & 1u,
+                      (reg >> 13) & 1u,
+                      (reg >> 12) & 1u,
+                      0);
+}
+
+static s32 psx_spu_sample_gauss(const struct psx_system *psx, int v)
+{
+    u32 idx = psx->spu_voice_idx[v];
+    u32 frac = (psx->spu_voice_phase[v] >> 8) & 0xFFu;
+    s32 oldest, older, old, current;
+
+    if (idx == 0u) {
+        oldest = psx->spu_voice_prev[v][0];
+        older  = psx->spu_voice_prev[v][1];
+        old    = psx->spu_voice_prev[v][2];
+        current = psx->spu_voice_samples[v][0];
+    } else if (idx == 1u) {
+        oldest = psx->spu_voice_prev[v][1];
+        older  = psx->spu_voice_prev[v][2];
+        old    = psx->spu_voice_samples[v][0];
+        current = psx->spu_voice_samples[v][1];
+    } else if (idx == 2u) {
+        oldest = psx->spu_voice_prev[v][2];
+        older  = psx->spu_voice_samples[v][0];
+        old    = psx->spu_voice_samples[v][1];
+        current = psx->spu_voice_samples[v][2];
+    } else {
+        oldest = psx->spu_voice_samples[v][idx - 3u];
+        older  = psx->spu_voice_samples[v][idx - 2u];
+        old    = psx->spu_voice_samples[v][idx - 1u];
+        current = psx->spu_voice_samples[v][idx];
+    }
+
+    return ((psx_spu_gauss[0x0FFu - frac] * oldest) >> 15) +
+           ((psx_spu_gauss[0x1FFu - frac] * older)  >> 15) +
+           ((psx_spu_gauss[0x100u + frac] * old)    >> 15) +
+           ((psx_spu_gauss[0x000u + frac] * current)  >> 15);
+}
+
+/* Compute ADSR envelope step delta and period for a given 7-bit rate.
+ * No$PSX formula: shift=rate>>2, step=7-(rate&3)
+ *   shift<=11: delta = step<<(11-shift), period = 1 sample
+ *   shift>11:  delta = step, period = 1<<(shift-11) samples */
+static void spu_adsr_rate(u32 rate7, s32 *delta, u32 *period) {
+    u32 shift = rate7 >> 2;
+    s32 step  = 7 - (s32)(rate7 & 3u);
+    if (shift <= 11u) { *delta = step << (11u - shift); *period = 1u; }
+    else              { *delta = step; *period = 1u << (shift - 11u); }
+}
+
+/* Advance ADSR envelope by one output sample for voice v.
+ * Registers: ADSR Lo = spu_regs[v*8+4], ADSR Hi = spu_regs[v*8+5] */
+static void spu_adsr_tick(struct psx_system *psx, int v) {
+    u16 lo    = psx->spu_regs[v*8 + 4];
+    u16 hi    = psx->spu_regs[v*8 + 5];
+    u8  phase = psx->spu_adsr_phase[v];
+    s32 vol   = psx->spu_adsr_vol[v];
+    s32 sustain_level = (s32)(((lo & 0xFu) + 1u) << 11);
+
+    if (phase == 0) {
+        spu_envelope_step(&vol, &psx->spu_adsr_cnt[v],
+                          ((u32)lo >> 10) & 0x1Fu,
+                          ((u32)lo >> 8) & 0x3u,
+                          ((u32)lo >> 15) & 1u,
+                          0, 0, 0);
+        if (vol >= 0x7FFF) {
+            vol = 0x7FFF;
+            phase = 1;
+            psx->spu_adsr_cnt[v] = 0;
+        }
+    } else if (phase == 1) {
+        spu_envelope_step(&vol, &psx->spu_adsr_cnt[v],
+                          ((u32)lo >> 4) & 0xFu,
+                          0u, 1, 1, 0, 1);
+        if (vol <= sustain_level) {
+            vol = sustain_level;
+            phase = 2;
+            psx->spu_adsr_cnt[v] = 0;
+        }
+    } else if (phase == 2) {
+        spu_envelope_step(&vol, &psx->spu_adsr_cnt[v],
+                          ((u32)hi >> 8) & 0x1Fu,
+                          ((u32)hi >> 6) & 0x3u,
+                          ((u32)hi >> 15) & 1u,
+                          ((u32)hi >> 14) & 1u,
+                          0, 0);
+        if (vol < 0)
+            vol = 0;
+        else if (vol > 0x7FFF)
+            vol = 0x7FFF;
+    } else {
+        spu_envelope_step(&vol, &psx->spu_adsr_cnt[v],
+                          (u32)hi & 0x1Fu,
+                          0u,
+                          ((u32)hi >> 5) & 1u,
+                          1, 0, 1);
+        if (vol <= 0) {
+            vol = 0;
+            psx->spu_voice_on &= ~(1u << v);
+        }
+    }
+
+    psx->spu_adsr_vol[v] = vol;
+    psx->spu_adsr_phase[v] = phase;
+    psx->spu_regs[v*8 + 6] = (u16)vol;
+}
+
+void psx_spu_render(struct psx_system *psx, s16 *out, u32 count) {
+    u16 spucnt = psx->spu_regs[SPU_REG_CTRL];
+    /* Output at 44100 Hz = native PSX SPU rate: no pitch scaling needed */
+    /* Bit 15: SPU Enable. Without it, output silence. */
+    if (!(spucnt & 0x8000u) || !(spucnt & 0x4000u)) {
+        if (out) for (u32 i = 0; i < count * 2u; i++) out[i] = 0;
+        return;
+    }
 
     for (u32 i = 0; i < count; i++) {
-        s32 mix_l = 0, mix_r = 0;
+        s64 mix_l = 0, mix_r = 0;
+
+        spu_volume_tick(psx->spu_regs[0xC0], &psx->spu_main_vol_cur[0], &psx->spu_main_vol_cnt[0]);
+        spu_volume_tick(psx->spu_regs[0xC1], &psx->spu_main_vol_cur[1], &psx->spu_main_vol_cnt[1]);
+
         for (int v = 0; v < 24; v++) {
             if (!(psx->spu_voice_on & (1u << v))) continue;
-            
-            u32 idx = psx->spu_voice_idx[v];
-            s32 sample = psx->spu_voice_samples[v][idx];
-            
-            s32 vol_l = (s16)psx->spu_regs[v*8 + 0];
-            s32 vol_r = (s16)psx->spu_regs[v*8 + 1];
-            
-            mix_l += (sample * vol_l) >> 15;
-            mix_r += (sample * vol_r) >> 15;
 
-            /* Advance phase */
-            u32 pitch = psx->spu_regs[v*8 + 2];
-            u32 step = pitch << 4; /* pitch 0x1000 = 1.0 = step 0x10000 */
-            psx->spu_voice_phase[v] += step;
-            
-            while (psx->spu_voice_phase[v] >= 0x10000) {
-                psx->spu_voice_phase[v] -= 0x10000;
+            s32 sample = psx_spu_sample_gauss(psx, v);
+
+            /* ADSR envelope: advance and scale sample */
+            spu_adsr_tick(psx, v);
+            s32 adsr = psx->spu_adsr_vol[v]; /* 0..0x7FFF */
+            s32 ampl = (sample * adsr) >> 15;
+
+            /* Per-voice L/R panning/volume (fixed or swept, signed). */
+            spu_volume_tick(psx->spu_regs[v*8 + 0],
+                            &psx->spu_voice_vol_cur[v][0],
+                            &psx->spu_voice_vol_cnt[v][0]);
+            spu_volume_tick(psx->spu_regs[v*8 + 1],
+                            &psx->spu_voice_vol_cur[v][1],
+                            &psx->spu_voice_vol_cnt[v][1]);
+            mix_l += ((s64)ampl * (s64)psx->spu_voice_vol_cur[v][0]) >> 15;
+            mix_r += ((s64)ampl * (s64)psx->spu_voice_vol_cur[v][1]) >> 15;
+
+            /* PSX SPU clock = 44100 Hz, PS5 output = 48000 Hz.
+             * Scale phase step so pitch=0x1000 plays at correct frequency. */
+            {
+                u32 pitch = (u32)psx->spu_regs[v*8 + 2];
+                if (pitch > 0x4000u)
+                    pitch = 0x4000u;
+                /* pitch << 4 = 16.0 fixed. Scale by 44100/48000 for host rate. */
+                psx->spu_voice_phase[v] += ((pitch << 4) * 44100u) / 48000u;
+            }
+
+            while (psx->spu_voice_phase[v] >= 0x10000u) {
+                psx->spu_voice_phase[v] -= 0x10000u;
                 psx->spu_voice_idx[v]++;
-                if (psx->spu_voice_idx[v] >= 28) {
+                if (psx->spu_voice_idx[v] >= 28u) {
                     psx->spu_voice_idx[v] = 0;
-                    u8 flags = psx->spu_ram[(psx->spu_voice_addr[v] + 1) & 0x7FFFFu];
-                    if (flags & 1) { /* End bit */
-                        psx->spu_voice_on &= ~(1u << v);
-                        break;
+                    u8 flags = psx->spu_ram[(psx->spu_voice_addr[v] + 1u) & 0x7FFFFu];
+
+                    /* Bit 2: Loop Start → latch this block as the repeat point */
+                    if (flags & 4u)
+                        psx->spu_regs[v*8 + 7] = (u16)(psx->spu_voice_addr[v] >> 3);
+
+                    if (flags & 1u) {
+                        psx->spu_endx |= (1u << v);
+                        /* Bit 0: Loop End */
+                        if (flags & 2u) {
+                            /* Bit 1: Loop Repeat → jump to latched repeat address */
+                            psx->spu_voice_addr[v] = ((u32)psx->spu_regs[v*8 + 7] << 3) & 0x7FFFFu;
+                        } else {
+                            /* End+Mute on hardware forces the envelope to zero and
+                             * then silences the voice after the current block. */
+                            psx->spu_adsr_vol[v] = 0;
+                            psx->spu_regs[v*8 + 6] = 0;
+                            psx->spu_voice_on &= ~(1u << v);
+                            break;
+                        }
+                    } else {
+                        /* Normal advance to next block */
+                        psx->spu_voice_addr[v] = (psx->spu_voice_addr[v] + 16u) & 0x7FFFFu;
                     }
-                    psx->spu_voice_addr[v] = (psx->spu_voice_addr[v] + 16) & 0x7FFFFu;
                     psx_spu_decode_block(psx, v);
                 }
             }
         }
-        
-        /* Apply master volume, then a small gain boost for debugging audio */
-        s32 final_l = ((mix_l * master_l) >> 15);
-        s32 final_r = ((mix_r * master_r) >> 15);
-        final_l = (final_l * 0x3FFF) >> 12;
-        final_r = (final_r * 0x3FFF) >> 12;
 
-        if (final_l > 32767) final_l = 32767; else if (final_l < -32768) final_l = -32768;
-        if (final_r > 32767) final_r = 32767; else if (final_r < -32768) final_r = -32768;
-        
+        /* >> 12 = 8x volume boost vs hardware-accurate >> 15 */
+        s64 final_l = (mix_l * (s64)psx->spu_main_vol_cur[0]) >> 12;
+        s64 final_r = (mix_r * (s64)psx->spu_main_vol_cur[1]) >> 12;
+        if (final_l >  32767) final_l =  32767; else if (final_l < -32768) final_l = -32768;
+        if (final_r >  32767) final_r =  32767; else if (final_r < -32768) final_r = -32768;
+
+        /* First-order IIR lowpass: y[n] = (x[n] + y[n-1]) / 2
+         * Simulates PSX DAC analog output stage, removes HF crackling artifacts. */
+        psx->spu_lpf_l = ((s32)final_l + psx->spu_lpf_l) >> 1;
+        psx->spu_lpf_r = ((s32)final_r + psx->spu_lpf_r) >> 1;
+
         if (out) {
-            out[i*2 + 0] = (s16)final_l;
-            out[i*2 + 1] = (s16)final_r;
+            out[i*2 + 0] = (s16)psx->spu_lpf_l;
+            out[i*2 + 1] = (s16)psx->spu_lpf_r;
         }
     }
 }

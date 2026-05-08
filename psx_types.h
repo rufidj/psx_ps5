@@ -17,10 +17,21 @@ struct psx_gpu_io {
     u32  cpuvram_x, cpuvram_y;   /* destination base in VRAM */
     u32  cpuvram_w, cpuvram_h;   /* copy dimensions */
     u32  cpuvram_cx, cpuvram_cy; /* current write cursor */
+    u32  vramcpu_active;
+    u32  vramcpu_x, vramcpu_y;   /* source base in VRAM */
+    u32  vramcpu_w, vramcpu_h;   /* copy dimensions */
+    u32  vramcpu_cx, vramcpu_cy; /* current read cursor */
 
     /* Current draw mode (from GP0 E1) */
     u32  texpage;          /* texpage word: tpx, tpy, semi-trans, depth */
+    u32  draw_mode_word;   /* full GP0(E1) word */
     u32  clut_x, clut_y;   /* CLUT base in VRAM (updated per-command) */
+    u32  mask_set;         /* GP0(E6).bit0 */
+    u32  mask_check;       /* GP0(E6).bit1 */
+    u32  rect_flip_x;      /* GP0(E1).bit12 */
+    u32  rect_flip_y;      /* GP0(E1).bit13 */
+    u32  dither_enable;    /* GP0(E1).bit9 */
+    u32  draw_to_display;  /* GP0(E1).bit10 */
 
     /* Drawing area / offset (from GP0 E3/E4/E5) */
     s32  draw_x1, draw_y1;
@@ -82,6 +93,15 @@ struct psx_system {
     u32  bios_ev_spec[16];
     u32  bios_ev_mode[16];
     u32  bios_ev_func[16];
+    u32  bios_pad_buf1;
+    u32  bios_pad_buf2;
+    u32  bios_pad_siz1;
+    u32  bios_pad_siz2;
+    u32  bios_pad_started;
+    u32  bios_pad_use_hidden;
+    u32  bios_pad_button_dest;
+    u8   bios_pad_hidden1[0x22];
+    u8   bios_pad_hidden2[0x22];
 
     /* I/O state — in struct to avoid static BSS init issues */
     u32  i_stat;
@@ -106,8 +126,13 @@ struct psx_system {
     u32  joy_mc_checksum;
     u32  joy_mc_flag;
     u32  joy_mc_write;
+    u32  joy_pad_config;
+    u32  joy_pad_mode;
+    u32  joy_pad_lock;
+    u32  joy_pad_analog;
     u8   joy_mc_buf[128];
     u8   joy_memcard[128 * 1024];
+    u32  pad_buttons_psx; /* PSX digital pad state, active low bits in 16-bit word */
 
     /* CD-ROM minimal state */
     u32  cd_idx;          /* register index (0–3) */
@@ -135,9 +160,9 @@ struct psx_system {
     u32  cd_pause_pending; /* Pause requested while a read is still in flight */
     u32  cd_boot_trace;   /* one-shot trace once BIOS asks for real disc data */
     u8   cd_sector_buf[2352]; /* buffer for one RAW sector */
-    u8   cd_fifo_data[8][2340]; /* queued CPU-visible sectors */
-    u16  cd_fifo_size[8];
-    u16  cd_fifo_pos[8];
+    u8   cd_fifo_data[32][2340]; /* queued CPU-visible sectors for ReadS/FMVs */
+    u16  cd_fifo_size[32];
+    u16  cd_fifo_pos[32];
     u32  cd_fifo_r;
     u32  cd_fifo_w;
     u32  cd_fifo_count;
@@ -212,14 +237,27 @@ struct psx_system {
     void *audio_out_fn;
     s16  *audio_vbuf; /* 16-bit stereo samples (must be in mmap-ed mem) */
     u32   audio_phase;
+    u32   audio_chunk_accum;
 
     u8    spu_ram[512 * 1024]; /* 512KB SPU RAM */
     u32   spu_voice_on;        /* bitmask of active voices */
+    u32   spu_endx;            /* bitmask of voices that reached LOOP-END */
     u32   spu_voice_addr[24];  /* current RAM address of the BLOCK */
     u32   spu_voice_idx[24];   /* current sample index within block (0-27) */
     u32   spu_voice_phase[24]; /* fractional phase for pitch (16.16 fixed point) */
     s16   spu_voice_samples[24][28]; /* cached decoded samples for the current block */
     s16   spu_voice_last[24][2]; /* ADPCM history for decoding */
+    s16   spu_voice_prev[24][3]; /* last three decoded samples of the previous block */
+    s32   spu_voice_vol_cur[24][2]; /* current L/R volume after sweep/fixed decode */
+    u32   spu_voice_vol_cnt[24][2]; /* sweep envelope counters for L/R volume */
+    s32   spu_main_vol_cur[2]; /* current master L/R volume after sweep/fixed decode */
+    u32   spu_main_vol_cnt[2]; /* sweep envelope counters for master L/R volume */
+    s32   spu_lpf_l, spu_lpf_r; /* IIR lowpass filter state for crackling reduction */
+
+    /* ADSR envelope state per voice */
+    s32   spu_adsr_vol[24];   /* current ADSR volume 0..0x7FFF */
+    u8    spu_adsr_phase[24]; /* 0=attack 1=decay 2=sustain 3=release */
+    u32   spu_adsr_cnt[24];   /* 15-bit envelope counters */
 };
 
 #endif /* PSX_TYPES_H */
