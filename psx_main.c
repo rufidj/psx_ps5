@@ -44,6 +44,13 @@ static void psx_log_pc(void *G, void *sfn, s32 fd, u8 *sa, const char *pfx,
 #include "psx_cpu.c"
 #include "psx_gpu.c"
 
+#define PSX_CYCLES_PER_NTSC_FRAME 564480u
+#define PSX_CYCLES_PER_PAL_FRAME  677376u
+
+static u32 psx_cycles_per_frame(struct psx_system *psx) {
+  return psx->gpu_io.pal ? PSX_CYCLES_PER_PAL_FRAME : PSX_CYCLES_PER_NTSC_FRAME;
+}
+
 static u32 psx_le32(const u8 *p) {
   return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24);
 }
@@ -784,19 +791,29 @@ static int psx_bios_launch_window(struct psx_system *psx) {
   u32 pc = psx->pc;
   if (!psx_bios_shell_ready(psx))
     return 0;
+  /* USA BIOSes (SCPH1x01/5x01/7x01): tight PC-range window before menu loop */
   if (pc >= 0x80067800u && pc < 0x80067900u)
-    return 0; /* Too late: BIOS shell/menu loop already reached */
+    return 0; /* Too late: stable menu loop */
   if (pc >= 0x80050000u && pc < 0x80067800u)
-    return 1; /* BIOS active before stable menu loop */
+    return 1; /* Active window */
+  /* EUR/JPN BIOS versions have different code layout — use GPU activity as trigger.
+   * 0x4000 GP0 words means the intro animation has run; safe to inject game. */
+  if (psx->gpu_io.gp0_total >= 0x4000u)
+    return 1;
   return 0;
 }
 
 static void psx_inject_bios_clut(struct psx_system *psx) {
   if (!psx->gpu_io.vram)
     return;
+  /* Only fill CLUT entries the BIOS hasn't written yet.
+   * EUR BIOS writes dark blue; USA/JPN write their own colors.
+   * With correct texel=0 transparency, the black background bug is gone. */
   u16 *cv = psx->gpu_io.vram + 384u * 1024u + 640u;
-  for (int k = 1; k < 16; k++)
-    cv[k] = 0x7FFFu;
+  for (int k = 1; k < 16; k++) {
+    if (!cv[k])
+      cv[k] = 0x7FFFu;
+  }
 }
 
 static s32 psx_vid_open(void *G, void *vid_open) {
@@ -1726,7 +1743,7 @@ _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     for (; warm_frames < 240u && !launch_ready; warm_frames++) {
       psx_bus_vblank(&st->sys);
       psx_inject_bios_clut(&st->sys);
-      for (u32 i = 0; i < 564480u; i++) {
+      for (u32 i = 0; i < psx_cycles_per_frame(&st->sys); i++) {
         psx_cpu_step(&st->sys);
         warm_steps++;
         if ((i & 0x1FFFu) == 0) {
@@ -1834,8 +1851,9 @@ _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
      * We use 180736 cycles/chunk so audio feeds continuously, preventing underruns. */
     if (st->sys.audio_h >= 0 && st->sys.audio_out_fn && st->sys.audio_vbuf) {
         void psx_spu_render(struct psx_system *psx, s16 *out, u32 count);
-        /* 564480 total cycles / 180736 = ~3.125 chunks per frame */
-        u32 cycles_left = 564480u;
+        /* Total cycles per frame / 180736 = ~3.125 chunks per frame */
+        u32 cycles_per_frame = psx_cycles_per_frame(&st->sys);
+        u32 cycles_left = cycles_per_frame;
         while (cycles_left > 0u) {
             u32 chunk_cycles = (cycles_left > 180736u) ? 180736u : cycles_left;
             for (u32 _i = 0; _i < chunk_cycles; _i++)
@@ -1851,7 +1869,7 @@ _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
         }
     } else {
         /* No audio: run CPU straight through */
-        for (u32 i = 0; i < 564480u; i++)
+        for (u32 i = 0; i < psx_cycles_per_frame(&st->sys); i++)
             psx_cpu_step(&st->sys);
     }
     /* ── GPU sync & Flip ─────────────────────────────────────── */
@@ -1867,6 +1885,12 @@ _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
                  "gp0=", st->sys.gpu_io.gp0_total);
       psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr,
                  "lc=", st->sys.gpu_io.last_cmd);
+      psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr,
+                 "dm=", st->sys.gpu_io.disp_mode);
+      psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr,
+                 "24b=", st->sys.gpu_io.disp_24bit);
+      psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr,
+                 "pal=", st->sys.gpu_io.pal);
       /* Sample VRAM for text rendering detection */
       if (st->sys.gpu_io.vram) {
         u16 *_v = st->sys.gpu_io.vram;

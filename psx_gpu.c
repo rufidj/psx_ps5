@@ -222,18 +222,17 @@ static void gpu_draw_tri_tex_uv(struct psx_gpu_io *g,
                 texel = g->vram[((tp_y + v) & 0x1FFu) * 1024u + ((tp_x + u) & 0x3FFu)];
             }
 
-            if (texel != 0) {
-                u16 out = texel;
-                int pix_semi = semi && (texel & 0x8000u);
-                if (!raw_tex) {
-                    u32 mod =
-                        ((u32)((cur_r >> 16) & 0xFFu)) |
-                        ((u32)((cur_g >> 16) & 0xFFu) << 8) |
-                        ((u32)((cur_b >> 16) & 0xFFu) << 16);
-                    out = gpu_modulate_texel(texel, mod);
-                }
-                gpu_write_pixel(g, ux, uy, out, pix_semi);
+            if (!texel) { cur_u += du; cur_v += dv; cur_r += dr; cur_g += dg; cur_b += db; continue; }
+            u16 out = texel;
+            int pix_semi = semi && (texel & 0x8000u);
+            if (!raw_tex) {
+                u32 mod =
+                    ((u32)((cur_r >> 16) & 0xFFu)) |
+                    ((u32)((cur_g >> 16) & 0xFFu) << 8) |
+                    ((u32)((cur_b >> 16) & 0xFFu) << 16);
+                out = gpu_modulate_texel(texel, mod);
             }
+            gpu_write_pixel(g, ux, uy, out, pix_semi);
             cur_u += du; cur_v += dv;
             cur_r += dr; cur_g += dg; cur_b += db;
         }
@@ -546,7 +545,7 @@ static void gpu_draw_tex_sprite(struct psx_gpu_io *g,
                 u32 ty = (tp_y + vv) & 0x1FFu;
                 texel  = g->vram[ty * 1024u + tx];
             }
-            if (texel == 0) continue; /* transparent */
+            if (!texel) continue;
             if (px < g->draw_x1 || px > g->draw_x2 || py < g->draw_y1 || py > g->draw_y2)
                 continue;
             {
@@ -852,6 +851,7 @@ static void gpu_gp0_exec(struct psx_gpu_io *g)
         g->cpuvram_h  = (g->fifo[2] >> 16) & 0xFFFFu;
         g->cpuvram_cx = g->cpuvram_x;
         g->cpuvram_cy = g->cpuvram_y;
+        g->cpuvram_byte_x = (g->cpuvram_x * 2u) & 0x7FFu;
         /* Track destination for diagnostic */
         {
             u32 _p = g->vram_dest_pos & 7u;
@@ -916,6 +916,34 @@ static void gpu_gp0_write(struct psx_gpu_io *g, u32 val)
 {
     /* Handle active CPU→VRAM copy: data arrives as pixel pairs */
     if (g->cpuvram_active) {
+        if (g->disp_24bit) {
+            u8 *vram8 = (u8 *)g->vram;
+            u32 row_bytes = g->cpuvram_w * 3u;
+            u32 row_start = (g->cpuvram_cy & 0x1FFu) * 2048u + (g->cpuvram_x * 2u);
+            u32 cur_byte = g->cpuvram_byte_x;
+            u8 bytes[4] = {
+                (u8)(val & 0xFFu),
+                (u8)((val >> 8) & 0xFFu),
+                (u8)((val >> 16) & 0xFFu),
+                (u8)((val >> 24) & 0xFFu)
+            };
+            for (int i = 0; i < 4; i++) {
+                vram8[(row_start + cur_byte) & 0xFFFFFu] = bytes[i];
+                cur_byte++;
+                if (cur_byte >= row_bytes) {
+                    cur_byte = 0;
+                    g->cpuvram_cy++;
+                    if (g->cpuvram_cy >= g->cpuvram_y + g->cpuvram_h) {
+                        g->cpuvram_active = 0;
+                        break;
+                    }
+                    row_start = (g->cpuvram_cy & 0x1FFu) * 2048u + (g->cpuvram_x * 2u);
+                }
+            }
+            g->cpuvram_byte_x = cur_byte;
+            return;
+        }
+
         u16 p[2];
         p[0] = (u16)(val & 0xFFFFu);
         p[1] = (u16)(val >> 16);
@@ -1013,6 +1041,7 @@ static void gpu_gp1_write(struct psx_gpu_io *g, u32 val)
         g->rect_flip_y  = 0;
         g->dither_enable = 0;
         g->draw_to_display = 0;
+        g->pal = 0;
         break;
     case 0x01: /* Reset command buffer */
         g->fifo_len  = 0;
@@ -1055,8 +1084,9 @@ static void gpu_gp1_write(struct psx_gpu_io *g, u32 val)
         }
         g->disp_mode = val & 0x7Fu;
         g->disp_w = hw;
-        g->disp_h = ((val >> 2) & 1u) ? 480u : 240u;
         g->disp_24bit = (val >> 4) & 1u;
+        g->pal = (val >> 3) & 1u;
+        g->disp_h = ((val >> 2) & 1u) ? 480u : 240u;
         g->gpustat = (g->gpustat & ~0x7F800u) | ((val & 0x3Fu) << 17);
         break;
     }
@@ -1118,38 +1148,35 @@ static void psx_gpu_sync_to_ps5(struct psx_system *psx, u32 *target_fb)
     u32 vx = g->disp_vram_x;
     u32 vy = g->disp_vram_y;
 
-    /* Stretch to fill 1920×1080 maintaining 4:3 aspect ratio.
-     * Pillarbox (black bars on sides) for 4:3 content in 16:9 display. */
+    /* PSX always outputs 4:3 on a CRT TV regardless of pixel resolution.
+     * Both NTSC (320x240) and PAL (320x288) fill the same 4:3 screen area.
+     * Fix: always pillarbox at 1440x1080 within 1920x1080 PS5 framebuffer. */
+    u32 dst_w = 1440u;
     u32 dst_h = 1080u;
-    u32 dst_w = dst_h * dw / dh;   /* preserve aspect ratio */
-    if (dst_w > 1920u) {
-        dst_w = 1920u;
-        dst_h = dst_w * dh / dw;
-    }
-    u32 ox = (1920u - dst_w) / 2u;
-    u32 oy = (1080u - dst_h) / 2u;
+    u32 ox = 240u;
+    u32 oy = 0u;
 
     u32 x_step = (dw << 16) / dst_w;
     u32 y_step = (dh << 16) / dst_h;
 
+    u32 src_y_fp = 0;
     if (g->disp_24bit) {
         u8 *vram8 = (u8 *)g->vram;
-        u32 src_y_fp = 0;
         for (u32 py = 0; py < dst_h; py++, src_y_fp += y_step) {
             u32 src_y = vy + (src_y_fp >> 16);
-            u32 row_base = (src_y & 0x1FFu) * 2048u + ((vx & 0x3FFu) * 2u);
+            u32 row_base = (src_y & 0x1FFu) * 2048u + (vx * 2u);
             u32 *dst_row = target_fb + (oy + py) * 1920u + ox;
             u32 src_x_fp = 0;
             for (u32 px = 0; px < dst_w; px++, src_x_fp += x_step) {
-                u32 boff = row_base + (src_x_fp >> 16) * 3u;
-                u8 r  = vram8[(boff + 0u) & 0xFFFFFu];
-                u8 g8 = vram8[(boff + 1u) & 0xFFFFFu];
-                u8 b  = vram8[(boff + 2u) & 0xFFFFFu];
+                u32 pixel = (src_x_fp >> 16);
+                u32 byte_off = row_base + pixel * 3u;
+                u8 r = vram8[byte_off & 0xFFFFFu];
+                u8 g8 = vram8[(byte_off + 1u) & 0xFFFFFu];
+                u8 b = vram8[(byte_off + 2u) & 0xFFFFFu];
                 dst_row[px] = 0xFF000000u | ((u32)r << 16) | ((u32)g8 << 8) | (u32)b;
             }
         }
     } else {
-        u32 src_y_fp = 0;
         for (u32 py = 0; py < dst_h; py++, src_y_fp += y_step) {
             u32 src_y = vy + (src_y_fp >> 16);
             const u16 *src_row = g->vram + (src_y & 0x1FFu) * 1024u;

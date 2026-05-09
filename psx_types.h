@@ -17,6 +17,7 @@ struct psx_gpu_io {
     u32  cpuvram_x, cpuvram_y;   /* destination base in VRAM */
     u32  cpuvram_w, cpuvram_h;   /* copy dimensions */
     u32  cpuvram_cx, cpuvram_cy; /* current write cursor */
+    u32  cpuvram_byte_x;        /* byte cursor within current row for 24-bit writes */
     u32  vramcpu_active;
     u32  vramcpu_x, vramcpu_y;   /* source base in VRAM */
     u32  vramcpu_w, vramcpu_h;   /* copy dimensions */
@@ -46,6 +47,7 @@ struct psx_gpu_io {
     u32  disp_mode;
     u32  disp_x1, disp_x2;
     u32  disp_y1, disp_y2;
+    u32  pal;              /* 1 = PAL, 0 = NTSC (from GP1(08).bit3) */
 
     u16 *vram;             /* 1024×512 × u16 */
     u32  gp0_total;        /* diagnostic: total GP0 words received */
