@@ -59,14 +59,7 @@ static void psx_cpu_log_bad_jump(struct psx_system *psx, u32 ins, u32 target,
 
 static void psx_cpu_log_exception(struct psx_system *psx)
 {
-    if (psx->exc_logged) return;
-    psx->exc_logged = 1;
-    psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
-               "[CPU] EXC cause=", psx->cp0_regs[13]);
-    psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
-               "[CPU] EXC epc=", psx->cp0_regs[14]);
-    psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
-               "[CPU] EXC vec=", psx->exception_vec);
+    (void)psx; /* EXC logs disabled */
 }
 
 static void psx_cpu_log_hot_loop(struct psx_system *psx)
@@ -74,33 +67,39 @@ static void psx_cpu_log_hot_loop(struct psx_system *psx)
     u32 pc = psx->pc;
     u32 ins;
     if (psx->hot_loop_logged) return;
-    if (pc < 0x8008B358u || pc > 0x8008B3ACu) return;
+    if (pc < 0x80029774u || pc > 0x8002978Cu) return;
     ins = psx_bus_read(psx, pc, 4);
     psx->hot_loop_logged = 1;
     psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
-               "[CPU] HotLoop PC=", pc);
+               "[CPU] HL PC=", pc);
     psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
-               "[CPU] HotLoop INS=", ins);
+               "[CPU] HL INS=", ins);
     psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
-               "[CPU] HotLoop V0=", psx->regs[2]);
+               "[CPU] HL istat=", psx->i_stat);
     psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
-               "[CPU] HotLoop V1=", psx->regs[3]);
+               "[CPU] HL imask=", psx->i_mask);
     psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
-               "[CPU] HotLoop A0=", psx->regs[4]);
+               "[CPU] HL SR=", psx->cp0_regs[12]);
     psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
-               "[CPU] HotLoop A2=", psx->regs[6]);
+               "[CPU] HL RA=", psx->regs[31]);
     psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
-               "[CPU] HotLoop A3=", psx->regs[7]);
+               "[CPU] HL S0=", psx->regs[16]);
     psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
-               "[CPU] HotLoop T0=", psx->regs[8]);
+               "[CPU] HL S1=", psx->regs[17]);
     psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
-               "[CPU] HotLoop T1=", psx->regs[9]);
+               "[CPU] HL V0=", psx->regs[2]);
     psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
-               "[CPU] HotLoop GP=", psx->regs[28]);
+               "[CPU] HL A0=", psx->regs[4]);
     psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
-               "[CPU] HotLoop PReg=", psx->load_pending_reg);
+               "[CPU] HL T0=", psx->regs[8]);
     psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
-               "[CPU] HotLoop PVal=", psx->load_pending_value);
+               "[CPU] HL T1=", psx->regs[9]);
+    /* Log 8 words around the stuck PC for disassembly */
+    for (u32 _i = 0; _i < 8u; _i++) {
+        u32 _w = psx_bus_read(psx, pc + _i*4u, 4);
+        psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
+                   "[CPU] HL W=", _w);
+    }
 }
 
 static void psx_cpu_log_bios_call(struct psx_system *psx)
@@ -111,6 +110,7 @@ static void psx_cpu_log_bios_call(struct psx_system *psx)
     u32 fn;
     int interesting = 0;
 
+    return; /* BIOS call logs disabled */
     if (psx->bios_call_logs >= 96u) return;
     fn = psx->regs[9] & 0xFFu;
     if (vec == 0xA0u) {
@@ -210,11 +210,12 @@ static int psx_cpu_handle_bios_event_call(struct psx_system *psx)
         return 1;
     }
 
-    if (fn == 0x13u) { /* StartPAD2() */
+    if (fn == 0x13u) { /* StartPAD2() — let BIOS ROM install real VBL handler.
+                        * The BIOS handler implements the J$/EPC-advance VSync wait
+                        * mechanism. We still set bios_pad_started so our own pad
+                        * buffer update continues, but we do NOT intercept the call. */
         psx->bios_pad_started = 1u;
-        psx->regs[2] = 1u;
-        psx->pc = psx->regs[31];
-        return 1;
+        return 0; /* pass-through: BIOS ROM installs its own VBL callback chain */
     }
 
     if (fn == 0x14u) { /* StopPAD2() */
@@ -256,8 +257,6 @@ static int psx_cpu_handle_bios_event_call(struct psx_system *psx)
                 psx->bios_cd_ev_enabled &= ~bit;
                 psx->bios_cd_ev_ready &= ~bit;
                 psx->regs[2] = psx_bios_cd_event_handle_from_slot(slot);
-                psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
-                           "[BIOS] EvOpen=", psx->regs[2]);
                 psx->pc = psx->regs[31];
                 return 1;
             }
@@ -273,8 +272,6 @@ static int psx_cpu_handle_bios_event_call(struct psx_system *psx)
             psx->bios_ev_mode[slot] = a2;
             psx->bios_ev_func[slot] = psx->regs[7];
             psx->regs[2] = psx_bios_event_handle_from_slot(slot);
-            psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
-                       "[BIOS] EvOpen=", psx->regs[2]);
             psx->pc = psx->regs[31];
             return 1;
         }
@@ -335,10 +332,7 @@ static int psx_cpu_handle_bios_event_call(struct psx_system *psx)
                 } else if (psx->bios_ev_ready & bit) {
                     psx->bios_ev_ready &= ~bit;
                     psx->regs[2] = 1;
-                    /* Reset log cap so post-CD-load activity is visible */
                     if (psx->bios_call_logs > 64u) psx->bios_call_logs = 64u;
-                    psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
-                               "[BIOS] WaitDone=", a0);
                 } else {
                     /* Real BIOS blocks here until the event becomes ready. */
                     return 1;
@@ -371,8 +365,6 @@ static int psx_cpu_handle_bios_event_call(struct psx_system *psx)
                 if (fn == 0x07u) {
                     if (psx->bios_cd_ev_enabled & bit)
                         psx->bios_cd_ev_ready |= bit;
-                    psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
-                               "[BIOS] EvDeliver=", a1);
                 } else {
                     psx->bios_cd_ev_ready &= ~bit;
                 }
@@ -388,13 +380,8 @@ static int psx_cpu_handle_bios_event_call(struct psx_system *psx)
             if (psx->bios_ev_class[slot] != a0 || psx->bios_ev_spec[slot] != a1)
                 continue;
             if (fn == 0x07u) {
-                /* Mark ready regardless of mode so WaitEvent can unblock.
-                 * Real HW marks ready for mode=0x2000 and calls func for
-                 * mode=0x8000; marking ready unconditionally covers both. */
                 if (psx->bios_ev_enabled & bit)
                     psx->bios_ev_ready |= bit;
-                psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
-                           "[BIOS] EvDeliver=", a1);
             } else {
                 psx->bios_ev_ready &= ~bit;
             }
@@ -702,6 +689,20 @@ static void psx_check_irq(struct psx_system *psx)
 
     /* Take hardware interrupt exception */
     psx->cp0_regs[14] = psx->pc;              /* EPC = interrupted PC */
+
+    /* VSync J$ exit: PSX games use "j $" (self-jump) as a VBL wait primitive.
+     * The BIOS VBL callback normally advances EPC past the loop. Simulate that
+     * here when VBL is pending and the interrupted instruction is a self-jump. */
+    if ((psx->i_stat & psx->i_mask & 1u) && psx->pc >= 0x80000000u
+                                          && psx->pc < 0x80200000u) {
+        u32 _ins = *(u32 *)(psx->ram + (psx->pc & 0x1FFFFFu));
+        if ((_ins >> 26) == 2u) { /* J instruction */
+            u32 _tgt = (psx->pc & 0xF0000000u) | ((_ins & 0x3FFFFFFu) << 2);
+            if (_tgt == psx->pc)  /* self-jump: skip J$ + delay slot */
+                psx->cp0_regs[14] = psx->pc + 8u;
+        }
+    }
+
     psx->cp0_regs[13] = (1u << 10);           /* Cause: IP[2], ExcCode=0 */
     psx->cp0_regs[12] = (sr & ~0x3Fu) | ((sr & 0x0Fu) << 2); /* KU/IE shift */
 

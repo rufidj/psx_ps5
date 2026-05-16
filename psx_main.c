@@ -2,6 +2,7 @@
  * GADGET_OFFSET / NC / SYM come from ps5_sdk_types.h (0x31AA9, fw13).
  */
 #include "example_common.h"
+#include "ps5_sdk/fakelibc/sys/stat.h"
 #include "ps5_sdk/ps5_sdk_core.h"
 #include "ps5_sdk/ps5_sdk_kernel.h"
 #include "ps5_sdk/ps5_sdk_types.h"
@@ -40,6 +41,35 @@ static void psx_log_pc(void *G, void *sfn, s32 fd, u8 *sa, const char *pfx,
   psx_udp_log(G, sfn, fd, sa, buf);
 }
 
+static void psx_log_str(void *G, void *sfn, s32 fd, u8 *sa, const char *pfx,
+                        const char *msg) {
+  char buf[320];
+  u32 i = 0;
+  if (!msg)
+    msg = "(null)";
+  while (pfx && pfx[i] && i < (sizeof(buf) - 2u)) {
+    buf[i] = pfx[i];
+    i++;
+  }
+  {
+    u32 j = 0;
+    while (msg[j] && i < (sizeof(buf) - 2u)) {
+      buf[i++] = msg[j++];
+    }
+  }
+  buf[i++] = '\n';
+  buf[i] = 0;
+  psx_udp_log(G, sfn, fd, sa, buf);
+}
+
+struct psx_system;
+static void psx_str_copy(char *dst, u32 cap, const char *src);
+static int psx_find_boot_path_fallback(struct psx_system *psx, char *out, u32 out_cap);
+static int psx_find_boot_path_file_scan(struct psx_system *psx, char *out, u32 out_cap);
+static void psx_boot_basename(const char *path, char *out, u32 out_cap);
+static int psx_find_file_by_name(struct psx_system *psx, const char *filename,
+                                 u32 *out_lba, u32 *out_size);
+
 #include "psx_bus.c"
 #include "psx_cpu.c"
 #include "psx_gpu.c"
@@ -70,22 +100,38 @@ static int psx_name_eq(const char *a, const u8 *b, u32 blen) {
   return (i == blen && a[i] == '\0');
 }
 
+static int psx_name_eq_flex(const char *a, const u8 *b, u32 blen) {
+  u32 i = 0;
+  for (; i < blen && a[i] && a[i] != ';'; i++) {
+    char ca = psx_ascii_upper(a[i]);
+    char cb = psx_ascii_upper((char)b[i]);
+    if (ca == '-' && cb == '_')
+      continue;
+    if (ca == '_' && cb == '-')
+      continue;
+    if (ca != cb)
+      return 0;
+  }
+  if (a[i] == ';' || a[i] == '\0') {
+    if (i == blen || b[i] == ';')
+      return 1;
+  }
+  return 0;
+}
+
 static int psx_read_logical_sector(struct psx_system *psx, u32 lba, u8 *dst) {
   u8 raw[2352];
-  if (!psx->kread_fn || !psx->klseek_fn || psx->cd_fd <= 0)
+  if (!psx->kpread_fn || psx->cd_fd < 0)
     return 0;
 
   if (psx->cd_sector_size == 2048u) {
     u64 off = (u64)lba * 2048ull;
-    NC(psx->G, psx->klseek_fn, (u64)psx->cd_fd, off, 0, 0, 0, 0);
-    return ((s32)NC(psx->G, psx->kread_fn, (u64)psx->cd_fd, (u64)dst, 2048, 0, 0,
-                    0) == 2048);
+    return ((s32)NC(psx->G, psx->kpread_fn, (u64)psx->cd_fd, (u64)dst, 2048, off, 0, 0) == 2048);
   }
 
   if (psx->cd_sector_size == 2352u) {
     u64 off = (u64)lba * 2352ull;
-    NC(psx->G, psx->klseek_fn, (u64)psx->cd_fd, off, 0, 0, 0, 0);
-    if ((s32)NC(psx->G, psx->kread_fn, (u64)psx->cd_fd, (u64)raw, 2352, 0, 0, 0) != 2352)
+    if ((s32)NC(psx->G, psx->kpread_fn, (u64)psx->cd_fd, (u64)raw, 2352, off, 0, 0) != 2352)
       return 0;
     {
       u32 data_off = (raw[15] == 0x01u) ? 16u : 24u;
@@ -97,8 +143,7 @@ static int psx_read_logical_sector(struct psx_system *psx, u32 lba, u8 *dst) {
 
   if (psx->cd_sector_size == 2336u) {
     u64 off = (u64)lba * 2336ull;
-    NC(psx->G, psx->klseek_fn, (u64)psx->cd_fd, off, 0, 0, 0, 0);
-    if ((s32)NC(psx->G, psx->kread_fn, (u64)psx->cd_fd, (u64)raw, 2336, 0, 0, 0) != 2336)
+    if ((s32)NC(psx->G, psx->kpread_fn, (u64)psx->cd_fd, (u64)raw, 2336, off, 0, 0) != 2336)
       return 0;
     for (u32 i = 0; i < 2048u; i++)
       dst[i] = raw[8u + i];
@@ -118,12 +163,11 @@ static int psx_sync_raw_sector(const u8 *buf) {
   return 1;
 }
 
-static int psx_read_bytes_at(void *G, void *klseek_fn, void *kread_fn, s32 fd,
+static int psx_read_bytes_at(void *G, void *kpread_fn, s32 fd,
                              u64 off, u8 *dst, u32 len) {
-  if (!G || !klseek_fn || !kread_fn || fd <= 0 || !dst || !len)
+  if (!G || !kpread_fn || fd < 0 || !dst || !len)
     return 0;
-  NC(G, klseek_fn, (u64)fd, off, 0, 0, 0, 0);
-  return ((s32)NC(G, kread_fn, (u64)fd, (u64)dst, len, 0, 0, 0) == (s32)len);
+  return ((s32)NC(G, kpread_fn, (u64)fd, (u64)dst, len, off, 0, 0) == (s32)len);
 }
 
 static int psx_pvd_valid(const u8 *buf) {
@@ -153,7 +197,7 @@ static int psx_path_has_ext(const char *path, const char *ext)
   return 1;
 }
 
-static u32 psx_detect_image_sector_size(void *G, void *klseek_fn, void *kread_fn,
+static u32 psx_detect_image_sector_size(void *G, void *kpread_fn,
                                         s32 fd, u64 fsz, const char *path) {
   u8 hdr[12];
   u8 pvd[2048];
@@ -169,29 +213,27 @@ static u32 psx_detect_image_sector_size(void *G, void *klseek_fn, void *kread_fn
   psx_local_zero(hdr, sizeof(hdr));
   psx_local_zero(pvd, sizeof(pvd));
 
-  if (psx_read_bytes_at(G, klseek_fn, kread_fn, fd, 0, hdr, 12u))
+  if (psx_read_bytes_at(G, kpread_fn, fd, 0, hdr, 12u))
     raw_sync0 = psx_sync_raw_sector(hdr);
 
   if (!fsz || (off2352_16 + 24ull + 2048ull) <= fsz) {
-    if (psx_read_bytes_at(G, klseek_fn, kread_fn, fd, off2352_16, hdr, 12u))
+    if (psx_read_bytes_at(G, kpread_fn, fd, off2352_16, hdr, 12u))
       raw_sync16 = psx_sync_raw_sector(hdr);
-    if (psx_read_bytes_at(G, klseek_fn, kread_fn, fd, off2352_16 + 24ull, pvd, 2048u))
+    if (psx_read_bytes_at(G, kpread_fn, fd, off2352_16 + 24ull, pvd, 2048u))
       raw_pvd_m2 = psx_pvd_valid(pvd);
-    if (psx_read_bytes_at(G, klseek_fn, kread_fn, fd, off2352_16 + 16ull, pvd, 2048u))
+    if (psx_read_bytes_at(G, kpread_fn, fd, off2352_16 + 16ull, pvd, 2048u))
       raw_pvd_m1 = psx_pvd_valid(pvd);
   }
 
   if (!fsz || (off2336_16 + 8ull + 2048ull) <= fsz) {
-    if (psx_read_bytes_at(G, klseek_fn, kread_fn, fd, off2336_16 + 8ull, pvd, 2048u))
+    if (psx_read_bytes_at(G, kpread_fn, fd, off2336_16 + 8ull, pvd, 2048u))
       raw2336_pvd = psx_pvd_valid(pvd);
   }
 
   if (!fsz || (off2048_16 + 2048ull) <= fsz) {
-    if (psx_read_bytes_at(G, klseek_fn, kread_fn, fd, off2048_16, pvd, 2048u))
+    if (psx_read_bytes_at(G, kpread_fn, fd, off2048_16, pvd, 2048u))
       iso_pvd = psx_pvd_valid(pvd);
   }
-
-  NC(G, klseek_fn, (u64)fd, 0, 0, 0, 0, 0);
 
   if (prefer_raw_ext && (raw_pvd_m2 || raw_pvd_m1 || raw_sync16 || raw_sync0))
     return 2352u;
@@ -395,6 +437,196 @@ static int psx_extract_boot_path(const u8 *buf, u32 len, char *out,
     out[o] = '\0';
     return (o > 0);
   }
+  return 0;
+}
+
+static void psx_boot_basename(const char *path, char *out, u32 out_cap)
+{
+  u32 start = 0, end = 0, i = 0;
+  if (!out || out_cap == 0)
+    return;
+  out[0] = '\0';
+  if (!path)
+    return;
+  while (path[end])
+    end++;
+  while (start < end) {
+    if (path[start] == '\\' || path[start] == '/')
+      i = start + 1u;
+    if (path[start] == ';') {
+      end = start;
+      break;
+    }
+    start++;
+  }
+  start = i;
+  i = 0;
+  while (start < end && i + 1u < out_cap)
+    out[i++] = psx_ascii_upper(path[start++]);
+  out[i] = '\0';
+}
+
+static int psx_find_file_by_name(struct psx_system *psx, const char *filename,
+                                 u32 *out_lba, u32 *out_size)
+{
+  char target[64];
+  u8 pvd[2048];
+  if (psx->cd_fd < 0)
+    return 0;
+  psx_boot_basename(filename, target, sizeof(target));
+  if (!target[0])
+    return 0;
+  if (!psx_read_logical_sector(psx, 16u, pvd))
+    return 0;
+  if (pvd[0] != 1 || pvd[1] != 'C' || pvd[2] != 'D' || pvd[3] != '0' ||
+      pvd[4] != '0' || pvd[5] != '1')
+    return 0;
+
+  {
+    u32 stack_lba[16], stack_size[16], stack_depth[16];
+    u32 sp = 0;
+    stack_lba[sp] = psx_le32(pvd + 158);
+    stack_size[sp] = psx_le32(pvd + 166);
+    stack_depth[sp] = 0;
+    sp++;
+    while (sp) {
+      u8 sec[2048];
+      u32 dir_lba, dir_size, depth;
+      sp--;
+      dir_lba = stack_lba[sp];
+      dir_size = stack_size[sp];
+      depth = stack_depth[sp];
+      if (depth > 6u)
+        continue;
+      for (u32 off_sec = 0; off_sec < dir_size; off_sec += 2048u) {
+        if (!psx_read_logical_sector(psx, dir_lba + (off_sec / 2048u), sec))
+          break;
+        for (u32 pos = 0; pos < 2048u;) {
+          u32 len = sec[pos];
+          if (!len)
+            break;
+          if (pos + len > 2048u)
+            break;
+          {
+            u32 flags = sec[pos + 25];
+            u32 name_len = sec[pos + 32];
+            const u8 *entry_name = sec + pos + 33;
+            if (name_len > 0 && entry_name[0] > 1) {
+              if (!(flags & 2u)) {
+                if (psx_name_eq_flex(target, entry_name, name_len)) {
+                  if (out_lba)
+                    *out_lba = psx_le32(sec + pos + 2);
+                  if (out_size)
+                    *out_size = psx_le32(sec + pos + 10);
+                  return 1;
+                }
+              } else if (sp < 16u) {
+                stack_lba[sp] = psx_le32(sec + pos + 2);
+                stack_size[sp] = psx_le32(sec + pos + 10);
+                stack_depth[sp] = depth + 1u;
+                sp++;
+              }
+            }
+          }
+          pos += len;
+        }
+      }
+    }
+  }
+
+  return 0;
+}
+
+static int psx_find_boot_path_fallback(struct psx_system *psx, char *out, u32 out_cap)
+{
+  u8 sec[2048];
+  u32 max_lba = psx->cd_total_sectors;
+  if (!out || out_cap == 0)
+    return 0;
+  out[0] = '\0';
+  if (max_lba == 0 || max_lba > 512u)
+    max_lba = 512u;
+  for (u32 lba = 0; lba < max_lba; lba++) {
+    if (!psx_read_logical_sector(psx, lba, sec))
+      continue;
+    if (psx_extract_boot_path(sec, sizeof(sec), out, out_cap))
+      return 1;
+  }
+  return 0;
+}
+
+static int psx_find_boot_path_file_scan(struct psx_system *psx, char *out, u32 out_cap)
+{
+  u8 buf[4224];
+  u32 overlap = 128u;
+  u32 chunk = 4096u;
+  u32 prev = 0u;
+  u64 off = 0u;
+  u64 limit = 2u * 1024u * 1024u;
+
+  if (!out || out_cap == 0)
+    return 0;
+  out[0] = '\0';
+  if (!psx || psx->cd_fd < 0 || !psx->kpread_fn)
+    return 0;
+
+  if (psx->sendto_fn && psx->log_fd >= 0)
+    psx_udp_log(psx->G, psx->sendto_fn, psx->log_fd, (u8 *)psx->log_addr,
+                "[BOOTSCAN] start");
+
+  if (psx->cd_sector_size && psx->cd_total_sectors) {
+    u64 total = (u64)psx->cd_sector_size * (u64)psx->cd_total_sectors;
+    if (total >= (64u * 2048u) && total < limit)
+      limit = total;
+  }
+  if (psx->sendto_fn && psx->log_fd >= 0)
+    psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
+               "[BOOTSCAN] limit=", (u32)limit);
+
+  while (off < limit) {
+    u32 want = chunk;
+    s32 got;
+    if (off + (u64)want > limit)
+      want = (u32)(limit - off);
+    if (want == 0u)
+      break;
+    got = (s32)NC(psx->G, psx->kpread_fn, (u64)psx->cd_fd, (u64)(buf + prev), want, off, 0, 0);
+    if (got <= 0)
+      break;
+    for (u32 i = 0; i + 4u < prev + (u32)got; i++) {
+      if (psx_ascii_upper((char)buf[i]) == 'B' &&
+          psx_ascii_upper((char)buf[i + 1]) == 'O' &&
+          psx_ascii_upper((char)buf[i + 2]) == 'O' &&
+          psx_ascii_upper((char)buf[i + 3]) == 'T') {
+        if (psx->sendto_fn && psx->log_fd >= 0)
+          psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
+                     "[BOOTSCAN] hit=", (u32)(off + i));
+        break;
+      }
+    }
+    if (psx_extract_boot_path(buf, prev + (u32)got, out, out_cap))
+    {
+      if (psx->sendto_fn && psx->log_fd >= 0)
+        psx_udp_log(psx->G, psx->sendto_fn, psx->log_fd, (u8 *)psx->log_addr,
+                    "[BOOTSCAN] parsed");
+      return 1;
+    }
+    if ((u32)got >= overlap) {
+      for (u32 i = 0; i < overlap; i++)
+        buf[i] = buf[(u32)got - overlap + i];
+      prev = overlap;
+    } else {
+      for (u32 i = 0; i < (u32)got; i++)
+        buf[i] = buf[prev + i];
+      prev = (u32)got;
+    }
+    off += (u64)got;
+  }
+
+  if (psx->sendto_fn && psx->log_fd >= 0)
+    psx_udp_log(psx->G, psx->sendto_fn, psx->log_fd, (u8 *)psx->log_addr,
+                "[BOOTSCAN] none");
+
   return 0;
 }
 
@@ -647,6 +879,70 @@ static u32 psx_detect_region_from_sector_text(struct psx_system *psx)
   return 3u;
 }
 
+/* Load LibCrypt Q-subchannel overrides from a .sbi file.
+ * SBI format: magic "SBI\0" + N×(3 bytes BCD MSF + 1 byte type + 10 bytes Q) */
+static void psx_load_sbi(struct psx_system *psx, void *G, void *kopen_fn,
+                         void *kread_fn, void *kclose_fn, void *klseek_fn,
+                         const char *bin_path) {
+  char sbi_path[256];
+  u32 i = 0, len = 0;
+  s32 fd;
+  u8 hdr[4];
+
+  psx->lc_count = 0;
+  if (!bin_path || !bin_path[0]) return;
+
+  while (bin_path[len]) len++;
+  if (len >= sizeof(sbi_path)) return;
+  for (i = 0; i < len; i++) sbi_path[i] = bin_path[i];
+  sbi_path[len] = '\0';
+
+  /* Replace last extension with .sbi */
+  {
+    u32 dot = len;
+    while (dot > 0 && sbi_path[dot - 1] != '.' && sbi_path[dot - 1] != '/')
+      dot--;
+    if (dot > 0 && sbi_path[dot - 1] == '.') {
+      sbi_path[dot - 1] = '\0';
+      len = dot - 1;
+    }
+  }
+  if (len + 4 >= sizeof(sbi_path)) return;
+  sbi_path[len] = '.'; sbi_path[len+1] = 's'; sbi_path[len+2] = 'b';
+  sbi_path[len+3] = 'i'; sbi_path[len+4] = '\0';
+
+  fd = (s32)NC(G, kopen_fn, (u64)sbi_path, 0, 0, 0, 0, 0);
+  if (fd < 0) return;
+
+  if ((s32)NC(G, kread_fn, (u64)fd, (u64)hdr, 4, 0, 0, 0) != 4 ||
+      hdr[0] != 'S' || hdr[1] != 'B' || hdr[2] != 'I' || hdr[3] != 0) {
+    NC(G, kclose_fn, (u64)fd, 0, 0, 0, 0, 0);
+    return;
+  }
+
+  psx_udp_log(G, psx->sendto_fn, psx->log_fd, (u8 *)psx->log_addr,
+              "[PSX] SBI cargado\n");
+
+  while (psx->lc_count < 64u) {
+    u8 entry[14]; /* 3 MSF + 1 type + 10 Q */
+    u32 mm, ss, ff, lba;
+    if ((s32)NC(G, kread_fn, (u64)fd, (u64)entry, 14, 0, 0, 0) != 14) break;
+    mm = (entry[0] >> 4) * 10u + (entry[0] & 0xFu);
+    ss = (entry[1] >> 4) * 10u + (entry[1] & 0xFu);
+    ff = (entry[2] >> 4) * 10u + (entry[2] & 0xFu);
+    lba = (mm * 60u + ss) * 75u + ff;
+    if (lba >= 150u) lba -= 150u; /* convert absolute MSF to LBA */
+    psx->lc_lba[psx->lc_count] = lba;
+    for (i = 0; i < 10u; i++)
+      psx->lc_q[psx->lc_count][i] = entry[4 + i];
+    psx->lc_count++;
+  }
+
+  psx_log_pc(G, psx->sendto_fn, psx->log_fd, psx->log_addr,
+             "[PSX] LibCrypt sects=", psx->lc_count);
+  NC(G, kclose_fn, (u64)fd, 0, 0, 0, 0, 0);
+}
+
 static void psx_detect_disc_boot_info(struct psx_system *psx)
 {
   u8 sec[2048];
@@ -657,6 +953,16 @@ static void psx_detect_disc_boot_info(struct psx_system *psx)
 
   if (!psx_iso_lookup_path(psx, "SYSTEM.CNF;1", &cnf_lba, &cnf_size))
   {
+    if (psx_find_boot_path_fallback(psx, psx->cd_boot_path,
+                                    sizeof(psx->cd_boot_path))) {
+      psx->cd_disc_region = psx_region_from_boot_path(psx->cd_boot_path);
+      return;
+    }
+    if (psx_find_boot_path_file_scan(psx, psx->cd_boot_path,
+                                     sizeof(psx->cd_boot_path))) {
+      psx->cd_disc_region = psx_region_from_boot_path(psx->cd_boot_path);
+      return;
+    }
     psx->cd_disc_region = psx_detect_region_from_sector_text(psx);
     return;
   }
@@ -665,6 +971,16 @@ static void psx_detect_disc_boot_info(struct psx_system *psx)
   if (!psx_extract_boot_path(sec, (cnf_size < sizeof(sec)) ? cnf_size : sizeof(sec),
                              psx->cd_boot_path, sizeof(psx->cd_boot_path)))
   {
+    if (psx_find_boot_path_fallback(psx, psx->cd_boot_path,
+                                    sizeof(psx->cd_boot_path))) {
+      psx->cd_disc_region = psx_region_from_boot_path(psx->cd_boot_path);
+      return;
+    }
+    if (psx_find_boot_path_file_scan(psx, psx->cd_boot_path,
+                                     sizeof(psx->cd_boot_path))) {
+      psx->cd_disc_region = psx_region_from_boot_path(psx->cd_boot_path);
+      return;
+    }
     psx->cd_disc_region = psx_detect_region_from_sector_text(psx);
     return;
   }
@@ -675,17 +991,28 @@ static void psx_detect_disc_boot_info(struct psx_system *psx)
 static int psx_direct_boot_game(struct psx_system *psx) {
   u8 sec[2048];
   char boot_path[96];
+  char boot_name[64];
   u32 cnf_lba, cnf_size, exe_lba, exe_size;
 
-  if (!psx_iso_lookup_path(psx, "SYSTEM.CNF;1", &cnf_lba, &cnf_size))
-    return 0;
-  if (!psx_read_logical_sector(psx, cnf_lba, sec))
-    return 0;
-  if (!psx_extract_boot_path(sec, (cnf_size < sizeof(sec)) ? cnf_size : sizeof(sec),
-                             boot_path, sizeof(boot_path)))
-    return 0;
-  if (!psx_iso_lookup_path(psx, boot_path, &exe_lba, &exe_size))
-    return 0;
+  if (!psx_iso_lookup_path(psx, "SYSTEM.CNF;1", &cnf_lba, &cnf_size)) {
+    if (psx->cd_boot_path[0]) {
+      psx_str_copy(boot_path, sizeof(boot_path), psx->cd_boot_path);
+    } else if (!psx_find_boot_path_fallback(psx, boot_path, sizeof(boot_path))) {
+      if (!psx_find_boot_path_file_scan(psx, boot_path, sizeof(boot_path)))
+        return 0;
+    }
+  } else {
+    if (!psx_read_logical_sector(psx, cnf_lba, sec))
+      return 0;
+    if (!psx_extract_boot_path(sec, (cnf_size < sizeof(sec)) ? cnf_size : sizeof(sec),
+                               boot_path, sizeof(boot_path)))
+      return 0;
+  }
+  if (!psx_iso_lookup_path(psx, boot_path, &exe_lba, &exe_size)) {
+    psx_boot_basename(boot_path, boot_name, sizeof(boot_name));
+    if (!psx_find_file_by_name(psx, boot_name, &exe_lba, &exe_size))
+      return 0;
+  }
   if (!psx_read_logical_sector(psx, exe_lba, sec))
     return 0;
 
@@ -739,6 +1066,7 @@ static int psx_direct_boot_game(struct psx_system *psx) {
   psx->i_stat = 0;
   psx->cp0_regs[13] = 0;
   psx->cp0_regs[12] &= ~1u; /* Disable IE on handoff; game will enable IRQs when ready */
+  psx->cd_shell_open = 0;   /* Disc is inserted; avoid spurious "media changed" on first GetStat */
   psx->cd_boot_trace = 1u;
   psx->exe_entry_pc = pc0;
   psx->exe_text_addr = text_addr;
@@ -914,6 +1242,36 @@ static int psx_str_eq(const char *a, const char *b) {
   return (*a == 0 && *b == 0);
 }
 
+static void psx_dirent_name_copy(char *dst, u32 cap, const char *src, u8 src_len) {
+  u32 i = 0;
+  if (!dst || !cap) return;
+  dst[0] = 0;
+  if (!src) return;
+  if (src_len) {
+    while (i < (u32)src_len && (i + 1u) < cap) {
+      char c = src[i];
+      if (!c || c == '/' || c == '\\')
+        break;
+      if ((unsigned char)c < 32u)
+        break;
+      dst[i] = c;
+      i++;
+    }
+    dst[i] = 0;
+    return;
+  }
+  while (src[i] && (i + 1u) < cap) {
+    char c = src[i];
+    if (c == '/' || c == '\\')
+      break;
+    if ((unsigned char)c < 32u)
+      break;
+    dst[i] = c;
+    i++;
+  }
+  dst[i] = 0;
+}
+
 static int psx_str_cmp(const char *a, const char *b) {
   while (*a && *b && *a == *b) {
     a++;
@@ -1083,20 +1441,23 @@ static void psx_menu_load(struct psx_menu_state *ms, void *G, void *mmap_fn,
     for (s32 off = 0; off + 8 <= n && ms->count < PSX_MENU_MAX_GAMES;) {
       u16 reclen = *(u16 *)(db + off + 4);
       u8 type = *(u8 *)(db + off + 6);
+      u8 namlen = *(u8 *)(db + off + 7);
       char *name = (char *)(db + off + 8);
+      char clean_name[256];
       if (reclen < 8 || off + reclen > n)
         break;
-      if (type == DT_REG && name[0] && !psx_str_eq(name, ".") &&
-          !psx_str_eq(name, "..") && psx_has_disc_extension(name)) {
+      psx_dirent_name_copy(clean_name, sizeof(clean_name), name, namlen);
+      if (type == DT_REG && clean_name[0] && !psx_str_eq(clean_name, ".") &&
+          !psx_str_eq(clean_name, "..") && psx_has_disc_extension(clean_name)) {
         psx_menu_make_title(ms->entries[ms->count].name,
-                            sizeof(ms->entries[ms->count].name), name);
+                            sizeof(ms->entries[ms->count].name), clean_name);
         psx_menu_make_label(ms->entries[ms->count].label,
-                            sizeof(ms->entries[ms->count].label), name);
+                            sizeof(ms->entries[ms->count].label), clean_name);
         psx_str_copy(ms->entries[ms->count].path,
                      sizeof(ms->entries[ms->count].path),
                      "/temp0/psx/games/");
         psx_str_cat(ms->entries[ms->count].path,
-                    sizeof(ms->entries[ms->count].path), name);
+                    sizeof(ms->entries[ms->count].path), clean_name);
         ms->entries[ms->count].launch_bios = 0u;
         ms->entries[ms->count].bios_file = 0u;
         ms->count++;
@@ -1149,21 +1510,24 @@ static void psx_menu_load_bios(struct psx_menu_state *ms, void *G, void *mmap_fn
     for (s32 off = 0; off + 8 <= n && ms->count < PSX_MENU_MAX_GAMES;) {
       u16 reclen = *(u16 *)(db + off + 4);
       u8 type = *(u8 *)(db + off + 6);
+      u8 namlen = *(u8 *)(db + off + 7);
       char *name = (char *)(db + off + 8);
+      char clean_name[256];
       if (reclen < 8 || off + reclen > n)
         break;
-      if (type == DT_REG && name[0] && !psx_str_eq(name, ".") &&
-          !psx_str_eq(name, "..") && psx_has_bios_extension(name)) {
-        u32 region = psx_region_from_bios_name(name);
+      psx_dirent_name_copy(clean_name, sizeof(clean_name), name, namlen);
+      if (type == DT_REG && clean_name[0] && !psx_str_eq(clean_name, ".") &&
+          !psx_str_eq(clean_name, "..") && psx_has_bios_extension(clean_name)) {
+        u32 region = psx_region_from_bios_name(clean_name);
         psx_menu_make_title(ms->entries[ms->count].name,
-                            sizeof(ms->entries[ms->count].name), name);
+                            sizeof(ms->entries[ms->count].name), clean_name);
         psx_menu_set_region_label(ms->entries[ms->count].label,
                                   sizeof(ms->entries[ms->count].label), region);
         psx_str_copy(ms->entries[ms->count].path,
                      sizeof(ms->entries[ms->count].path),
                      "/temp0/psx/bios/");
         psx_str_cat(ms->entries[ms->count].path,
-                    sizeof(ms->entries[ms->count].path), name);
+                    sizeof(ms->entries[ms->count].path), clean_name);
         ms->entries[ms->count].launch_bios = 0u;
         ms->entries[ms->count].bios_file = 1u;
         ms->count++;
@@ -1352,6 +1716,7 @@ _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
   void *kread_fn = SYM(G, D, LIBKERNEL_HANDLE, KERNEL_sceKernelRead);
   void *klseek_fn = SYM(G, D, LIBKERNEL_HANDLE, KERNEL_sceKernelLseek);
   void *kclose_fn = SYM(G, D, LIBKERNEL_HANDLE, KERNEL_sceKernelClose);
+  void *kstat_fn = SYM(G, D, LIBKERNEL_HANDLE, KERNEL_sceKernelStat);
   void *getdents_fn = SYM(G, D, LIBKERNEL_HANDLE, KERNEL_sceKernelGetdents);
   void *load_mod = SYM(G, D, LIBKERNEL_HANDLE, KERNEL_sceKernelLoadStartModule);
   void *alloc_dm =
@@ -1360,6 +1725,7 @@ _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
   void *rel_dm =
       SYM(G, D, LIBKERNEL_HANDLE, KERNEL_sceKernelReleaseDirectMemory);
   void *cancel_fn = SYM(G, D, LIBKERNEL_HANDLE, KERNEL_scePthreadCancel);
+  void *kpread_fn = SYM(G, D, LIBKERNEL_HANDLE, KERNEL_pread);
 
   if (!mmap_fn || !usleep_fn)
     return;
@@ -1368,14 +1734,15 @@ _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
 
   LOG("[PSX] Init\n");
 
-  if (load_mod)
-    NC(G, load_mod, (u64)"libScePad.sprx", 0, 0, 0, 0, 0);
-  void *pad_init_fn = SYM(G, D, PAD_HANDLE, "scePadInit");
-  void *pad_geth_fn = SYM(G, D, PAD_HANDLE, "scePadGetHandle");
-  void *pad_read_fn = SYM(G, D, PAD_HANDLE, "scePadRead");
+  s32 pad_mod = load_mod ? (s32)NC(G, load_mod, (u64)"libScePad.sprx", 0, 0, 0, 0, 0) : -1;
+  void *pad_init_fn = SYM(G, D, pad_mod, "scePadInit");
+  void *pad_geth_fn = SYM(G, D, pad_mod, "scePadGetHandle");
+  void *pad_read_fn = SYM(G, D, pad_mod, "scePadRead");
   if (pad_init_fn)
     NC(G, pad_init_fn, 0, 0, 0, 0, 0, 0);
   s32 pad_h = pad_geth_fn ? (s32)NC(G, pad_geth_fn, (u64)ext->dbg[3], 0, 0, 0, 0, 0) : -1;
+  psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr, "[PSX] PadMod=", (u32)pad_mod);
+  psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr, "[PSX] PadH=", (u32)pad_h);
   u8 *pad_buf = (u8 *)NC(G, mmap_fn, 0, 0x1000, 3, 0x1002, (u64)-1, 0);
   if (!pad_buf || (s64)pad_buf == -1)
     pad_buf = 0;
@@ -1494,6 +1861,12 @@ _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     else
       psx_udp_log(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr,
                   "[PSX] Menu selecciono BIOS\n");
+    if (selected_game[0])
+      psx_log_str(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr,
+                  "[PSX] GamePath=", selected_game);
+    if (selected_bios[0])
+      psx_log_str(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr,
+                  "[PSX] BiosPath=", selected_bios);
   }
 
   /* ── PSX state ────────────────────────────────────────────── */
@@ -1546,18 +1919,49 @@ _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
   st->sys.kopen_fn = kopen_fn;
   st->sys.klseek_fn = klseek_fn;
   st->sys.kread_fn = kread_fn;
+  st->sys.kpread_fn = kpread_fn;
   st->sys.cd_fd = -1;
   if (selected_game[0]) {
+    if (kstat_fn) {
+      struct stat st_path;
+      psx_local_zero((u8 *)&st_path, sizeof(st_path));
+      if ((s32)NC(G, kstat_fn, (u64)selected_game, (u64)&st_path, 0, 0, 0, 0) == 0) {
+        psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr,
+                   "[PSX] PathMode=", (u32)st_path.st_mode);
+        psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr,
+                   "[PSX] PathSize=", (u32)st_path.st_size);
+      } else {
+        LOG("[PSX] PathStat fail\n");
+      }
+    }
+    psx_log_str(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr,
+                "[PSX] Opening=", selected_game);
     st->sys.cd_fd =
         (s32)NC(G, kopen_fn, (u64)selected_game, O_RDONLY, 0, 0, 0, 0);
   }
-  if (st->sys.cd_fd > 0) {
+  if (st->sys.cd_fd >= 0) {
     LOG("[PSX] Juego abierto\n");
     st->sys.cd_shell_open = 1;
     {
+      u8 hdr[16];
+      /* On PS5/FreeBSD the kernel stat struct has st_size at offset 96,
+       * different from the fakelibc layout — use lseek SEEK_END instead. */
       s64 fsz = (s64)NC(G, klseek_fn, (u64)st->sys.cd_fd, 0, 2, 0, 0, 0);
+      psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr,
+                 "[PSX] FileSize=", (u32)((fsz > 0) ? (u64)fsz : 0u));
+      psx_local_zero(hdr, sizeof(hdr));
+      if (psx_read_bytes_at(G, kpread_fn, st->sys.cd_fd, 0, hdr, sizeof(hdr))) {
+        psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr,
+                   "[PSX] Head0=", psx_le32(hdr + 0));
+        psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr,
+                   "[PSX] Head1=", psx_le32(hdr + 4));
+        psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr,
+                   "[PSX] Head2=", psx_le32(hdr + 8));
+        psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr,
+                   "[PSX] Head3=", psx_le32(hdr + 12));
+      }
       st->sys.cd_sector_size =
-          psx_detect_image_sector_size(G, klseek_fn, kread_fn, st->sys.cd_fd,
+          psx_detect_image_sector_size(G, kpread_fn, st->sys.cd_fd,
                                        (fsz > 0) ? (u64)fsz : 0u,
                                        selected_game);
       if (st->sys.cd_sector_size == 2352u)
@@ -1568,13 +1972,16 @@ _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
         LOG("[PSX] Formato ISO (2048 bytes/sector)\n");
       if (fsz > 0)
         st->sys.cd_total_sectors = (u32)((u64)fsz / st->sys.cd_sector_size);
+      psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr,
+                 "[PSX] TotalSec=", st->sys.cd_total_sectors);
       if (psx_path_has_ext(selected_game, ".bin") && st->sys.cd_sector_size == 2048u) {
         psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr,
                    "[PSX] DetectFileSize=", (u32)((fsz > 0) ? (u64)fsz : 0u));
       }
     }
-    NC(G, klseek_fn, (u64)st->sys.cd_fd, 0, 0, 0, 0, 0); /* reset to start */
     psx_detect_disc_boot_info(&st->sys);
+    psx_load_sbi(&st->sys, G, kopen_fn, kread_fn, kclose_fn, klseek_fn,
+                 selected_game);
     if (st->sys.cd_disc_region == 3u) {
       u32 file_region = psx_region_from_filename(selected_game);
       if (file_region != 3u)
@@ -1600,15 +2007,15 @@ _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     st->sys.cd_console_region = 3u;
 #define TRY_BIOS(path, region_id)                                              \
     do {                                                                       \
-      if (fd <= 0) {                                                           \
+      if (fd < 0) {                                                            \
         fd = (s32)NC(G, kopen_fn, (u64)(path), 0, 0, 0, 0, 0);                \
-        if (fd > 0)                                                            \
+        if (fd >= 0)                                                           \
           st->sys.cd_console_region = (region_id);                             \
       }                                                                        \
     } while (0)
     if (selected_bios[0]) {
       fd = (s32)NC(G, kopen_fn, (u64)selected_bios, 0, 0, 0, 0, 0);
-      if (fd > 0)
+      if (fd >= 0)
         st->sys.cd_console_region = psx_region_from_bios_name(selected_bios);
     } else if (st->sys.cd_disc_region == 1u) {
       TRY_BIOS("/data/psx/bios/SCPH1001.bin", 1u);
@@ -1662,7 +2069,7 @@ _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
       TRY_BIOS("/temp0/psx/bios/scph7000.bin", 0u);
       TRY_BIOS("/temp0/psx/bios/scph7500.bin", 0u);
     }
-    if (fd <= 0) {
+    if (fd < 0) {
       TRY_BIOS("/data/psx/bios/SCPH1001.bin", 1u);
       TRY_BIOS("/data/psx/bios/SCPH5501.bin", 1u);
       TRY_BIOS("/data/psx/bios/SCPH7001.bin", 1u);
@@ -1713,7 +2120,7 @@ _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
       TRY_BIOS("/temp0/psx/bios/scph7500.bin", 0u);
     }
 #undef TRY_BIOS
-    if (fd <= 0) {
+    if (fd < 0) {
       LOG("[PSX] Error: BIOS\n");
       ext->status = -6;
       goto cleanup_fb;
@@ -1735,7 +2142,7 @@ _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
   if (!st->sys.gpu_io.vram)
     LOG("[PSX] WARN: VRAM null\n");
 
-  if (st->sys.cd_fd > 0) {
+  if (st->sys.cd_fd >= 0) {
     u32 warm_steps = 0;
     u32 warm_frames = 0;
     u32 warm_pc = 0;
@@ -1785,19 +2192,8 @@ _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
             psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr,
                        "[SPU] FirstNZ V0ra=", st->sys.spu_voice_addr[0]);
           }
-          s32 wret = (s32)NC(G, st->sys.audio_out_fn, (u64)st->sys.audio_h,
+          (void)(s32)NC(G, st->sys.audio_out_fn, (u64)st->sys.audio_h,
              (u64)st->sys.audio_vbuf, 0, 0, 0, 0);
-          /* Always log first output result to confirm driver accepts buffer */
-          if (warm_frames == 0) {
-            psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr,
-                       "[SPU] out0 ret=", (u32)wret);
-            psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr,
-                       "[SPU] out0 L=", (u32)(u16)st->sys.audio_vbuf[0]);
-            psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr,
-                       "[SPU] V0adsr=", (u32)st->sys.spu_adsr_vol[0]);
-            psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr,
-                       "[SPU] MVcur=", (u32)st->sys.spu_main_vol_cur[0]);
-          }
         }
       }
     }

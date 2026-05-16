@@ -111,6 +111,7 @@ struct psx_system {
     u32  timer0, timer1, timer2;
     u32  timer_div;
     u32  timer0_acc, timer1_acc, timer2_acc;
+    u32  timer0_mode, timer1_mode, timer2_mode; /* mode regs with overflow/irq flags */
 
     /* SIO0 / JOY state */
     u32  joy_mode;
@@ -180,6 +181,15 @@ struct psx_system {
     u32  cd_irq_timer;
     u32  cd_mode;         /* bit 5: 1=RAW, 0=Data */
     u32  cd_read_active;  /* 1 = drive is reading sectors */
+    u32  cd_q_lba;        /* LBA of last sector whose Q-subchannel was captured */
+    /* LibCrypt: up to 16 protected sectors with Q-subchannel override */
+    u32  lc_count;
+    u32  lc_snap_lba;   /* 0 = no snap; else hold cd_q_lba here until drive reaches it */
+    u32  lc_snap_idx;   /* index of the entry currently snapped (for marking) */
+    u32  lc_snapped[2]; /* 64-bit bitmask: entry i snapped (skip it on next SetLoc) */
+    u32  lc_log_cnt;    /* capped [LC] log counter, reset each game start */
+    u32  lc_lba[64];
+    u8   lc_q[64][10]; /* Q subchannel bytes (ADR/CTL + TNO+IDX+MSF+AMSFQ) */
     u32  cd_tick_acc;     /* cycle accumulator for sector delivery */
     u32  cd_busy_ticks;   /* brief BUSYSTS window after command writes */
     u32  cd_filter_file;  /* SetFilter file number */
@@ -232,7 +242,7 @@ struct psx_system {
     void *sendto_fn;
     s32   log_fd;
     u8    log_addr[16];
-    void *kopen_fn, *klseek_fn, *kread_fn;
+    void *kopen_fn, *klseek_fn, *kread_fn, *kpread_fn;
 
     /* AudioOut state */
     s32   audio_h;

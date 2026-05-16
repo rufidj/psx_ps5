@@ -1035,13 +1035,18 @@ static void psx_cd_exec_cmd(struct psx_system *psx, u32 cmd)
                                    psx_cd_region_matches_console(psx) ? 2u : 5u,
                                    id, 8, 338688);
         }
-    } else if (cmd == 0x0A) { /* Init */
+    } else if (cmd == 0x0A) { /* Init — full reset of drive state */
         psx->cd_mode = 0;
         psx->cd_req = 0;
         psx->cd_read_active = 0;
+        psx->cd_read_after_seek = 0;
+        psx->cd_seek_pending = 0;
+        psx->cd_setloc_pending = 0;
         psx->cd_pause_pending = 0;
+        psx->cd_read_cmd = 0;
         psx->cd_filter_file = 0;
         psx->cd_filter_channel = 0;
+        psx->cd_tick_acc = 0;
         psx_cd_fifo_reset(psx);
         resp[0] = stat;
         psx_cd_set_resp(psx, 3u, resp, 1);
@@ -1050,6 +1055,27 @@ static void psx_cd_exec_cmd(struct psx_system *psx, u32 cmd)
     } else if (cmd == 0x02) { /* SetLoc */
         psx->cd_seek_lba = psx_bcd_to_lba(psx->cd_bcd);
         psx->cd_setloc_pending = 1;
+        psx->cd_q_lba = psx->cd_seek_lba; /* pre-set Q lba so GetLocL works before DMA tick */
+        /* LibCrypt seek-snap: the game seeks to (LC_sector - 3) repeatedly until
+         * GetLocP returns the right Q-subchannel. Hold cd_q_lba at the target LC
+         * sector; once the drive passes it, mark it snapped so the next seek within
+         * range snaps to the NEXT LC sector (e.g. the +5 pair partner). */
+        if (psx->lc_count > 0u && !psx->lc_snap_lba) {
+            u32 lc_si, lc_best = 0xFFFFFFFFu, lc_bd = 10u;
+            for (lc_si = 0; lc_si < psx->lc_count; lc_si++) {
+                /* skip sectors we have already snapped/delivered */
+                if (psx->lc_snapped[lc_si >> 5] & (1u << (lc_si & 31u))) continue;
+                if (psx->lc_lba[lc_si] > psx->cd_seek_lba) {
+                    u32 d = psx->lc_lba[lc_si] - psx->cd_seek_lba;
+                    if (d < lc_bd) { lc_bd = d; lc_best = lc_si; }
+                }
+            }
+            if (lc_best != 0xFFFFFFFFu) {
+                psx->lc_snap_lba = psx->lc_lba[lc_best];
+                psx->lc_snap_idx = lc_best;
+                psx->cd_q_lba    = psx->lc_lba[lc_best];
+            }
+        }
         resp[0] = stat;
         psx_cd_set_resp(psx, 3u, resp, 1);
     } else if (cmd == 0x44) { /* SetFilter: select XA file+channel for interleave */
@@ -1086,19 +1112,21 @@ static void psx_cd_exec_cmd(struct psx_system *psx, u32 cmd)
     } else if (cmd == 0x09) { /* Pause */
         resp[0] = stat;
         psx_cd_set_resp(psx, 3u, resp, 1);
-        if (psx->cd_read_active || psx->cd_read_after_seek) {
-            /* Games commonly issue ReadN immediately followed by Pause to fetch
-             * exactly one sector. Hardware keeps the in-flight read alive until
-             * the next INT1 sector delivery, then transitions to paused state. */
+        if (psx->cd_read_active) {
+            /* Drive actively reading — let current sector finish, then stop.
+             * INT1 fires for the in-flight sector, INT2 follows after pause. */
             psx->cd_pause_pending = 1;
         } else {
+            /* Drive is seeking or idle — cancel immediately, no INT1 expected.
+             * Real hardware fires INT2 (pause done) without delivering a sector. */
             psx->cd_read_cmd = 0;
             psx->cd_read_active = 0;
             psx->cd_read_after_seek = 0;
+            psx->cd_seek_pending = 0;
             psx->cd_pause_pending = 0;
             psx_cd_fifo_reset(psx);
             resp[0] = psx_cd_stat(psx);
-            psx_cd_set_second_resp(psx, 2u, resp, 1, 0);
+            psx_cd_set_second_resp(psx, 2u, resp, 1, 338688);
         }
     } else if (cmd == 0x0B || cmd == 0x0C) { /* Mute / Demute */
         resp[0] = stat;
@@ -1114,24 +1142,96 @@ static void psx_cd_exec_cmd(struct psx_system *psx, u32 cmd)
         resp[3] = psx->cd_filter_file & 0xFFu;
         resp[4] = psx->cd_filter_channel & 0xFFu;
         psx_cd_set_resp(psx, 3u, resp, 5);
-    } else if (cmd == 0x10) { /* GetLocL */
-        u8 m, s, f, file, channel, submode, coding;
-        psx_lba_to_msf(psx->cd_sector, &m, &s, &f);
-        psx_cd_get_subheader(psx, &file, &channel, &submode, &coding);
-        resp[0] = m; resp[1] = s; resp[2] = f;
-        resp[3] = 0x02u;
-        resp[4] = file;
-        resp[5] = channel;
-        resp[6] = submode;
-        resp[7] = coding;
+    } else if (cmd == 0x10) { /* GetLocL - returns Q subchannel: AmAdr,TNO,Idx,Rm,Rs,Rf,Am,As,Af */
+        u32 q_lba = psx->cd_q_lba;
+        u32 lc_i;
+        int lc_hit = 0;
+        for (lc_i = 0; lc_i < psx->lc_count; lc_i++) {
+            if (psx->lc_lba[lc_i] == q_lba) { lc_hit = 1; break; }
+        }
+        if (lc_hit) {
+            psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
+                       "[LC] GetLocL lba=", q_lba);
+            /* SBI Q bytes: [ADR/CTL,TNO,Idx,Rm,Rs,Rf,0x00,Am,As,Af] — skip byte 6 */
+            resp[0] = psx->lc_q[lc_i][0]; /* ADR/CTL */
+            resp[1] = psx->lc_q[lc_i][1]; /* TNO */
+            resp[2] = psx->lc_q[lc_i][2]; /* Index */
+            resp[3] = psx->lc_q[lc_i][3]; /* Rm */
+            resp[4] = psx->lc_q[lc_i][4]; /* Rs */
+            resp[5] = psx->lc_q[lc_i][5]; /* Rf */
+            resp[6] = psx->lc_q[lc_i][7]; /* Am (skip 0x00 at [6]) */
+            resp[7] = psx->lc_q[lc_i][8]; /* As */
+            resp[8] = psx->lc_q[lc_i][9]; /* Af */
+            psx_cd_set_resp(psx, 3u, resp, 9);
+        } else {
+            u8 am, as_bcd, af, rm, rs, rf;
+            u32 abs = q_lba + 150u;
+            u32 rel_mm = q_lba / (60u * 75u);
+            u32 rel_rem = q_lba % (60u * 75u);
+            u32 abs_mm = abs / (60u * 75u);
+            u32 abs_rem = abs % (60u * 75u);
+            rm = psx_to_bcd(rel_mm);
+            rs = psx_to_bcd(rel_rem / 75u);
+            rf = psx_to_bcd(rel_rem % 75u);
+            am = psx_to_bcd(abs_mm);
+            as_bcd = psx_to_bcd(abs_rem / 75u);
+            af = psx_to_bcd(abs_rem % 75u);
+            resp[0] = 0x41u; /* ADR=1, CTL=4: data track */
+            resp[1] = 0x01u; /* TNO: track 1 */
+            resp[2] = 0x01u; /* Index 1 */
+            resp[3] = rm; resp[4] = rs; resp[5] = rf;
+            resp[6] = am; resp[7] = as_bcd; resp[8] = af;
+            psx_cd_set_resp(psx, 3u, resp, 9);
+        }
+    } else if (cmd == 0x11) { /* GetLocP - Track,Index,Rm,Rs,Rf,0,Am,As */
+        u32 qlba = psx->cd_q_lba;
+        /* LibCrypt: exact match. cd_q_lba is pre-snapped to the LC sector
+         * at SetLoc time when the seek is within 4 sectors of a protected sector. */
+        {
+            u32 lcp_i;
+            for (lcp_i = 0; lcp_i < psx->lc_count; lcp_i++) {
+                if (psx->lc_lba[lcp_i] == qlba) {
+                    if (psx->lc_log_cnt < 48u) {
+                        psx->lc_log_cnt++;
+                        psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
+                                   "[LC] GetLocP lba=", qlba);
+                    }
+                    /* Mark this entry snapped immediately so the next SetLoc in the
+                     * same area advances the snap to the next LC sector (e.g. +5 pair
+                     * partner) instead of re-snapping to this one again. */
+                    psx->lc_snapped[lcp_i >> 5] |= (1u << (lcp_i & 31u));
+                    psx->lc_snap_lba = 0u; /* release snap; delivery code also safe */
+                    /* SBI Q: [ADR/CTL,TNO,Idx,Rm,Rs,Rf,0,Am,As,Af]
+                     * GetLocP format: Track,Index,Rm,Rs,Rf,Am,As,Af (no 0x00) */
+                    resp[0] = psx->lc_q[lcp_i][1]; /* TNO */
+                    resp[1] = psx->lc_q[lcp_i][2]; /* Index */
+                    resp[2] = psx->lc_q[lcp_i][3]; /* Rm */
+                    resp[3] = psx->lc_q[lcp_i][4]; /* Rs */
+                    resp[4] = psx->lc_q[lcp_i][5]; /* Rf */
+                    resp[5] = psx->lc_q[lcp_i][7]; /* Am (skip 0x00 at [6]) */
+                    resp[6] = psx->lc_q[lcp_i][8]; /* As */
+                    resp[7] = psx->lc_q[lcp_i][9]; /* Af */
+                    psx_cd_set_resp(psx, 3u, resp, 8);
+                    goto getlocp_done;
+                }
+            }
+        }
+        {
+        /* GetLocP format: Track,Index,Rm,Rs,Rf,Am,As,Af (8 bytes, no 0x00 padding) */
+        u32 abs = qlba + 150u;
+        u32 abs_mm = abs / (60u * 75u), abs_rem = abs % (60u * 75u);
+        u32 rel_mm = qlba / (60u * 75u), rel_rem = qlba % (60u * 75u);
+        resp[0] = 0x01u;                       /* track 1 BCD */
+        resp[1] = 0x01u;                       /* index 1 */
+        resp[2] = psx_to_bcd(rel_mm);          /* Rm */
+        resp[3] = psx_to_bcd(rel_rem / 75u);   /* Rs */
+        resp[4] = psx_to_bcd(rel_rem % 75u);   /* Rf */
+        resp[5] = psx_to_bcd(abs_mm);          /* Am */
+        resp[6] = psx_to_bcd(abs_rem / 75u);   /* As */
+        resp[7] = psx_to_bcd(abs_rem % 75u);   /* Af */
         psx_cd_set_resp(psx, 3u, resp, 8);
-    } else if (cmd == 0x11) { /* GetLocP */
-        u8 m, s, f;
-        psx_lba_to_msf(psx->cd_sector, &m, &s, &f);
-        resp[0] = 0x01; resp[1] = 0x01;
-        resp[2] = m; resp[3] = s; resp[4] = f;
-        resp[5] = m; resp[6] = s; resp[7] = f;
-        psx_cd_set_resp(psx, 3u, resp, 8);
+        }
+        getlocp_done:;
     } else if (cmd == 0x12) { /* SetSession */
         resp[0] = stat;
         psx_cd_set_resp(psx, 3u, resp, 1);
@@ -1866,8 +1966,16 @@ static void dma1_exec(struct psx_system *psx)
             else
                 psx_mdec_decode_monochrome_macroblock(psx, out, &out_bytes);
 
-            if (!out_bytes)
+            if (!out_bytes) {
+                /* MDEC decode not implemented: output black (zeros) for
+                 * this macroblock so DMA1 completes and the game advances.
+                 * FMV plays as black frames until MDEC is rewritten. */
+                while (remaining_words) {
+                    psx_mdec_write_u32_ram(psx, &addr, 0u);
+                    remaining_words--;
+                }
                 break;
+            }
 
             out_words = (out_bytes + 3u) >> 2;
             for (u32 i = 0; i < out_words && remaining_words; i++) {
@@ -2088,7 +2196,10 @@ u32 psx_bus_read(struct psx_system *psx, u32 addr, int width)
         case 0x1F801100: return psx->timer0 & 0xFFFFu;
         case 0x1F801110: return psx->timer1 & 0xFFFFu;
         case 0x1F801120: return psx->timer2 & 0xFFFFu;
-        case 0x1F801104: case 0x1F801114: case 0x1F801124: return 0; /* Mode */
+        /* Timer mode: bit 11=IRQ, bit 12=reached target, bit 13=overflow (read-clears) */
+        case 0x1F801104: { u32 v = psx->timer0_mode; psx->timer0_mode &= ~0x3800u; return v; }
+        case 0x1F801114: { u32 v = psx->timer1_mode; psx->timer1_mode &= ~0x3800u; return v; }
+        case 0x1F801124: { u32 v = psx->timer2_mode; psx->timer2_mode &= ~0x3800u; return v; }
         case 0x1F801108: case 0x1F801118: case 0x1F801128: return 0; /* Target */
         /* DMA channel 2 (GPU) */
         case 0x1F8010A0: return psx->dma_madr[2];
@@ -2158,6 +2269,16 @@ void psx_bus_write(struct psx_system *psx, u32 addr, u32 val, int width)
         switch (phys) {
         case 0x1F801070: psx->i_stat &= val; break;
         case 0x1F801074: psx->i_mask  = val; break;
+        /* Timer counter writes reset the counter */
+        case 0x1F801100: psx->timer0 = val & 0xFFFFu; break;
+        case 0x1F801110: psx->timer1 = val & 0xFFFFu; break;
+        case 0x1F801120: psx->timer2 = val & 0xFFFFu; break;
+        /* Timer mode writes: store config, clear overflow/irq flags */
+        case 0x1F801104: psx->timer0_mode = val & 0x3FFu; break;
+        case 0x1F801114: psx->timer1_mode = val & 0x3FFu; break;
+        case 0x1F801124: psx->timer2_mode = val & 0x3FFu; break;
+        /* Timer target writes (store but not used yet) */
+        case 0x1F801108: case 0x1F801118: case 0x1F801128: break;
         case 0x1F801820:
             psx_mdec_write_command(psx, val);
             break;
@@ -2319,17 +2440,15 @@ void psx_bus_write(struct psx_system *psx, u32 addr, u32 val, int width)
                 words *= blocks;
                 u32 spu_addr = psx->spu_addr_internal & 0x7FFFFu;
                 u32 spu_start = spu_addr;
-                /* Log first DMA4 transfer: SPU dest, RAM src, first word of data */
+                /* Log DMA4 only when data is non-zero (skip silence zerofill) */
                 {
                     u32 _first = (addr + 3u < RAM_SIZE) ? *(u32*)(psx->ram + addr) : 0u;
-                    psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
-                               "[DMA4] spuDst=", spu_addr);
-                    psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
-                               "[DMA4] ramSrc=", addr);
-                    psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
-                               "[DMA4] data0=", _first);
-                    psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
-                               "[DMA4] words=", words);
+                    if (_first) {
+                        psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
+                                   "[DMA4] spuDst=", spu_addr);
+                        psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
+                                   "[DMA4] words=", words);
+                    }
                 }
                 psx_spu_refresh_stat(psx, 1);
                 for (u32 i = 0; i < words; i++) {
@@ -2423,18 +2542,24 @@ void psx_bus_tick(struct psx_system *psx, u32 cycles)
     /* Timer 2: ~4.2MHz (div 8) */
     psx->timer0_acc += cycles;
     if (psx->timer0_acc >= 4) {
+        u32 old0 = psx->timer0;
         psx->timer0 = (psx->timer0 + psx->timer0_acc / 4) & 0xFFFFu;
         psx->timer0_acc %= 4;
+        if (psx->timer0 < old0) { psx->i_stat |= (1u << 4); psx->timer0_mode |= 0x2800u; } /* overflow+IRQ bits */
     }
     psx->timer1_acc += cycles;
     if (psx->timer1_acc >= 2153) {
+        u32 old1 = psx->timer1;
         psx->timer1 = (psx->timer1 + psx->timer1_acc / 2153) & 0xFFFFu;
         psx->timer1_acc %= 2153;
+        if (psx->timer1 < old1) { psx->i_stat |= (1u << 5); psx->timer1_mode |= 0x2800u; }
     }
     psx->timer2_acc += cycles;
     if (psx->timer2_acc >= 8) {
+        u32 old2 = psx->timer2;
         psx->timer2 = (psx->timer2 + psx->timer2_acc / 8) & 0xFFFFu;
         psx->timer2_acc %= 8;
+        if (psx->timer2 < old2) { psx->i_stat |= (1u << 6); psx->timer2_mode |= 0x2800u; }
     }
 
     /* 1. Update CD-ROM second response timer */
@@ -2453,6 +2578,9 @@ void psx_bus_tick(struct psx_system *psx, u32 cycles)
         psx->cd_irq_second = 0;
         psx->cd_seek_pending = 0;
         psx->i_stat |= (1u << 2);
+        if (psx->cd_irq_pending == 2u)
+            psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
+                       "[CD] INT2 istat=", psx->i_stat);
     }
 
     if (psx->cd_seek_pending && psx->cd_irq_pending == 0 && psx->cd_read_after_seek) {
@@ -2474,12 +2602,11 @@ void psx_bus_tick(struct psx_system *psx, u32 cycles)
         
         if (psx->cd_tick_acc >= threshold) {
             psx->cd_tick_acc = 0;
-            if (psx->cd_fd > 0 && psx->kread_fn && psx->klseek_fn) {
+            if (psx->cd_fd >= 0 && psx->kpread_fn) {
                 u32 lba = psx->cd_sector;
                 u32 sec_size = psx->cd_sector_size;
                 u64 off = (u64)lba * (u64)sec_size;
-                NC(psx->G, psx->klseek_fn, (u64)psx->cd_fd, off, 0, 0, 0, 0);
-                
+
                 u8 *buf = psx->cd_sector_buf;
                 if (sec_size == 2048) {
                     /* ISO image: Synthesize RAW header */
@@ -2489,7 +2616,7 @@ void psx_bus_tick(struct psx_system *psx, u32 cycles)
                     buf[12] = mm; buf[13] = ss; buf[14] = ff;
                     buf[15] = 0x02;
                     for(int k=16; k<24; k++) buf[k] = 0;
-                    NC(psx->G, psx->kread_fn, (u64)psx->cd_fd, (u64)(buf + 24), 2048, 0, 0, 0);
+                    NC(psx->G, psx->kpread_fn, (u64)psx->cd_fd, (u64)(buf + 24), 2048, off, 0, 0);
                     for(int k=2072; k<2352; k++) buf[k] = 0;
                 } else if (sec_size == 2336) {
                     u8 mm, ss, ff;
@@ -2497,11 +2624,11 @@ void psx_bus_tick(struct psx_system *psx, u32 cycles)
                     psx_lba_to_msf(lba, &mm, &ss, &ff);
                     buf[12] = mm; buf[13] = ss; buf[14] = ff;
                     buf[15] = 0x02;
-                    if ((s32)NC(psx->G, psx->kread_fn, (u64)psx->cd_fd, (u64)(buf + 16), 2336, 0, 0, 0) != 2336) {
+                    if ((s32)NC(psx->G, psx->kpread_fn, (u64)psx->cd_fd, (u64)(buf + 16), 2336, off, 0, 0) != 2336) {
                         for(int k=16; k<2352; k++) buf[k] = 0;
                     }
                 } else {
-                    NC(psx->G, psx->kread_fn, (u64)psx->cd_fd, (u64)buf, 2352, 0, 0, 0);
+                    NC(psx->G, psx->kpread_fn, (u64)psx->cd_fd, (u64)buf, 2352, off, 0, 0);
                 }
 
                 {
@@ -2513,6 +2640,21 @@ void psx_bus_tick(struct psx_system *psx, u32 cycles)
                     psx->cd_last_coding = coding;
                 }
 
+                /* LibCrypt snap: hold cd_q_lba at the snap target until the drive
+                 * physically delivers that sector; when it clears, mark it snapped
+                 * so the next SetLoc in the same area snaps to the NEXT LC sector. */
+                if (psx->lc_snap_lba && psx->cd_sector < psx->lc_snap_lba) {
+                    psx->cd_q_lba = psx->lc_snap_lba;
+                } else {
+                    psx->cd_q_lba = psx->cd_sector;
+                    if (psx->lc_snap_lba) {
+                        /* mark this entry as snapped so we advance to the next one */
+                        u32 idx = psx->lc_snap_idx;
+                        if (idx < 64u)
+                            psx->lc_snapped[idx >> 5] |= (1u << (idx & 31u));
+                        psx->lc_snap_lba = 0u;
+                    }
+                }
                 psx->cd_sector++;
 
                 /* XA audio sectors inside interleaved STR/XA streams must not be
@@ -2559,9 +2701,24 @@ static void psx_bus_vblank(struct psx_system *psx)
     psx_pad_update_bios_buffers(psx);
 
     /* Update SPU status bit */
-    psx->spu_regs[SPU_REG_STAT] |= 0x400; 
+    psx->spu_regs[SPU_REG_STAT] |= 0x400;
 
     psx->gpu_io.gpustat ^= 0x80000000u;
+
+    /* Deliver vsync event (class=0xF0000011) to our intercepted event slots.
+     * The BIOS ROM's VBL ISR updates its own internal ECB table directly (without
+     * calling B0:07), so our DeliverEvent intercept never fires for vsync events.
+     * We must deliver them here instead. */
+    {
+        u32 slot;
+        for (slot = 0; slot < 16u; slot++) {
+            u32 bit = 1u << slot;
+            if (!(psx->bios_ev_open & bit)) continue;
+            if (psx->bios_ev_class[slot] != 0xF0000011u) continue;
+            if (psx->bios_ev_enabled & bit)
+                psx->bios_ev_ready |= bit;
+        }
+    }
 }
 
 
