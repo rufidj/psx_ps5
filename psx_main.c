@@ -1726,6 +1726,13 @@ _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
       SYM(G, D, LIBKERNEL_HANDLE, KERNEL_sceKernelReleaseDirectMemory);
   void *cancel_fn = SYM(G, D, LIBKERNEL_HANDLE, KERNEL_scePthreadCancel);
   void *kpread_fn = SYM(G, D, LIBKERNEL_HANDLE, KERNEL_pread);
+  void *mdec_create_sema_fn = SYM(G, D, LIBKERNEL_HANDLE, KERNEL_sceKernelCreateSema);
+  void *mdec_wait_sema_fn = SYM(G, D, LIBKERNEL_HANDLE, KERNEL_sceKernelWaitSema);
+  void *mdec_signal_sema_fn = SYM(G, D, LIBKERNEL_HANDLE, KERNEL_sceKernelSignalSema);
+  void *mdec_create_thread_fn = SYM(G, D, LIBKERNEL_HANDLE, KERNEL_scePthreadCreate);
+  void *mdec_attr_init_fn = SYM(G, D, LIBKERNEL_HANDLE, KERNEL_scePthreadAttrInit);
+  void *mdec_attr_setstacksize_fn = SYM(G, D, LIBKERNEL_HANDLE, KERNEL_scePthreadAttrSetstacksize);
+  void *mdec_attr_destroy_fn = SYM(G, D, LIBKERNEL_HANDLE, KERNEL_scePthreadAttrDestroy);
 
   if (!mmap_fn || !usleep_fn)
     return;
@@ -1888,6 +1895,7 @@ _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
   st->sys.pad_buttons_psx = 0xFFFFu;
   st->sys.cd_disc_region = 3u;
   st->sys.cd_console_region = 3u;
+  st->sys.dma_dpcr = 0x07654361u;
   psx_mdec_reset(&st->sys);
 
   st->sys.ram = (u8 *)NC(G, mmap_fn, 0, 0x200000, 3, 0x1002, (u64)-1, 0);
@@ -1920,6 +1928,17 @@ _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
   st->sys.klseek_fn = klseek_fn;
   st->sys.kread_fn = kread_fn;
   st->sys.kpread_fn = kpread_fn;
+  st->sys.mdec_create_sema_fn = mdec_create_sema_fn;
+  st->sys.mdec_wait_sema_fn = mdec_wait_sema_fn;
+  st->sys.mdec_signal_sema_fn = mdec_signal_sema_fn;
+  st->sys.mdec_create_thread_fn = mdec_create_thread_fn;
+  st->sys.mdec_attr_init_fn = mdec_attr_init_fn;
+  st->sys.mdec_attr_setstacksize_fn = mdec_attr_setstacksize_fn;
+  st->sys.mdec_attr_destroy_fn = mdec_attr_destroy_fn;
+  /* Force synchronous MDEC decode: the async worker thread causes the CD ISR
+   * to miss FMV video sectors that arrive during decode, breaking frame 3+.
+   * Sync decode blocks psx_cpu_step so no sectors are delivered mid-decode. */
+  LOG("[PSX] MDEC sync mode\n");
   st->sys.cd_fd = -1;
   if (selected_game[0]) {
     if (kstat_fn) {
@@ -2227,6 +2246,10 @@ _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
 
   /* ── Main loop ────────────────────────────────────────────── */
   u32 vblank = 0;
+  u32 fmv_last_d0n = 0;
+  u32 fmv_last_cdsc = 0;
+  u32 fmv_idle_vbls = 0;
+  u32 fmv_exit_cooldown = 0;
   for (;;) {
     if (pad_read_fn && pad_h >= 0 && pad_buf) {
       u32 raw = 0, btns = 0;
@@ -2237,6 +2260,44 @@ _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     }
     psx_bus_vblank(&st->sys);
     vblank++;
+
+    /* FMV exit assist: the FMV wait loop (80087A84-ADC) exits when sp10=-1.
+     * The BIOS overwrites 0x801FFF80 on every ISR, so sp10 never reaches -1.
+     * We force the exit by jumping PC to 0x80087AA4 (cleanup path: JAL×3 +
+     * j 0x80087AE4).  But only when the FMV is truly finished — not during
+     * inter-frame audio loading (which causes cdsc to keep changing).
+     *
+     * Rules:
+     *  - Count idle VBLs only when BOTH d0n AND cdsc have been stable.
+     *  - d0n changes every ~2.5 VBLs during video decode → resets counter.
+     *  - cdsc changes during audio loading (CD seeking/reading) → resets counter.
+     *  - Only when both are quiet for 120 VBLs (2s): the FMV is done → exit.
+     *  - Cooldown: 120 VBLs after exit before re-triggering. */
+    {
+      u32 _d0   = st->sys.mdec_dma0_cnt;
+      u32 _cdsc = st->sys.cd_sector;
+      if (_d0 != fmv_last_d0n || _cdsc != fmv_last_cdsc) {
+        fmv_last_d0n  = _d0;
+        fmv_last_cdsc = _cdsc;
+        fmv_idle_vbls = 0;
+      } else if (_d0 > 0u && fmv_exit_cooldown == 0u) {
+        fmv_idle_vbls++;
+        if (fmv_idle_vbls >= 120u) {
+          u32 _pc = st->sys.pc;
+          if (_pc >= 0x80087A84u && _pc <= 0x80087ADCu) {
+            st->sys.pc = 0x80087AA4u;
+            fmv_idle_vbls = 0;
+            fmv_exit_cooldown = 120u;
+            st->sys.mdec_log_flags &= ~0x800u;
+            psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr,
+                       "[FMV] exit! d0n=", _d0);
+          } else {
+            fmv_idle_vbls = 0;
+          }
+        }
+      }
+      if (fmv_exit_cooldown > 0u) fmv_exit_cooldown--;
+    }
 
     /* Re-inject CLUT: BIOS shell needs this for text visibility */
     psx_inject_bios_clut(&st->sys);
@@ -2275,75 +2336,62 @@ _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     st->gpu.fb_idx++;
 
     if ((vblank % 30u) == 0) {
+      struct psx_system *sy = &st->sys;
       psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr, "vbl=", vblank);
       LOGPC("PC=");
-      psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr,
-                 "gp0=", st->sys.gpu_io.gp0_total);
-      psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr,
-                 "lc=", st->sys.gpu_io.last_cmd);
-      psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr,
-                 "dm=", st->sys.gpu_io.disp_mode);
-      psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr,
-                 "24b=", st->sys.gpu_io.disp_24bit);
-      psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr,
-                 "pal=", st->sys.gpu_io.pal);
-      /* Sample VRAM for text rendering detection */
-      if (st->sys.gpu_io.vram) {
-        u16 *_v = st->sys.gpu_io.vram;
+      psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr, "gp0=", sy->gpu_io.gp0_total);
+      if (sy->gpu_io.vram) {
+        u16 *_v = sy->gpu_io.vram;
         psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr,
                    "t230=", _v[230u * 1024u + 73u]);
       }
-    }
-
-    /* SPU diagnostics every 60 VBLANKs (~1 second) */
-    if ((vblank % 60u) == 0) {
-      struct psx_system *sy = &st->sys;
-      /* Audio handle: -1 means sceAudioOutOpen failed → complete silence */
-      psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr,
-                 "AHN=", (u32)sy->audio_h);
-      /* Last rendered samples — L=vbuf[0], R=vbuf[1] */
-      if (sy->audio_vbuf) {
-        psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr,
-                   "AUDL=", (u32)(u16)sy->audio_vbuf[0]);
-        psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr,
-                   "AUDR=", (u32)(u16)sy->audio_vbuf[1]);
-      }
-      /* SPUCNT: bit15=enable, bit14=unmute */
-      psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr,
-                 "SPUCNT=", (u32)sy->spu_regs[0xD5]);
-      /* Active voice bitmask (bits 0-23) */
-      psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr,
-                 "VON=", sy->spu_voice_on);
-      /* Master volume L/R */
-      psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr,
-                 "MVOL=", ((u32)sy->spu_regs[0xC0] << 16) | sy->spu_regs[0xC1]);
-      /* Voice 0: ADSR vol, vol L|R, running address, block data */
-      psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr,
-                 "V0ad=", (u32)sy->spu_adsr_vol[0]);
-      psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr,
-                 "V0vl=", ((u32)sy->spu_regs[0] << 16) | sy->spu_regs[1]);
+      psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr, "d0n=", sy->mdec_dma0_cnt);
+      psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr, "d1n=", sy->mdec_dma1_cnt);
+      psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr, "cdsc=", sy->cd_sector);
+      /* FMV wait-loop: a0=threshold, v0=SLT result, sp10=local counter, ADR/VAL=what's tested */
+      psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr, "a0=", sy->regs[4]);
+      psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr, "v0=", sy->regs[2]);
       {
-        u32 _ra = sy->spu_voice_addr[0] & 0x7FFFFu;
-        psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr,
-                   "V0ra=", sy->spu_voice_addr[0]);
-        psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr,
-                   "V0h=", (u32)sy->spu_ram[_ra]); /* ADPCM header (shift in bits 3-0) */
-        /* First non-silent voice in VON: show its ra and header */
-        for (u32 _vv = 1; _vv < 24; _vv++) {
-          if (sy->spu_voice_on & (1u << _vv)) {
-            u32 _ra2 = sy->spu_voice_addr[_vv] & 0x7FFFFu;
-            u8 _h = sy->spu_ram[_ra2];
-            if ((_h & 0xFu) >= 4u || *(u32*)(sy->spu_ram + _ra2) != 0u) {
-              psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr,
-                         "Vxn=", _vv);
-              psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr,
-                         "Vxra=", sy->spu_voice_addr[_vv]);
-              psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr,
-                         "Vxh=", (u32)_h);
-              psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr,
-                         "Vxad=", (u32)sy->spu_adsr_vol[_vv]);
-              break;
-            }
+        u32 _ph = (sy->regs[29] + 0x10u) & 0x1FFFFFu;
+        if (_ph + 3u < 0x200000u)
+          psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr,
+                     "sp10=", *(u32 *)(sy->ram + _ph));
+      }
+      /* Decode instructions at the 3 unknown positions in the FMV loop */
+      if (sy->ram) {
+        u32 ia94 = *(u32 *)(sy->ram + 0x087A94u);
+        u32 iad0 = *(u32 *)(sy->ram + 0x087AD0u);
+        u32 iad4 = *(u32 *)(sy->ram + 0x087AD4u);
+        /* One-time dump of the 11 instructions at 80087AA0-AC8 (the sp10==-1 path
+         * that decides whether to exit the FMV wait loop or keep going).
+         * Uses mdec_log_flags bit 0x400 to avoid static local vars (no GOT in this build). */
+        if (!(sy->mdec_log_flags & 0x400u)) {
+          sy->mdec_log_flags |= 0x400u;
+          for (u32 _xi = 0; _xi < 11u; _xi++)
+            psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr, "Xi=",
+                       *(u32 *)(sy->ram + (0x087AA0u + _xi*4u)));
+        }
+        psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr, "A94i=", ia94);
+        psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr, "AD0i=", iad0);
+        psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr, "AD4i=", iad4);
+        /* Auto-resolve the address and value that the SLT compares against a0 */
+        {
+          u32 op0 = iad0 >> 26, rs0 = (iad0>>21)&31u, rt0 = (iad0>>16)&31u;
+          u32 im0 = iad0 & 0xFFFFu;
+          u32 op4 = iad4 >> 26, im4 = iad4 & 0xFFFFu;
+          u32 addr = 0, ph;
+          if (rs0==2u && rt0==2u && op4==0x23u) {
+            if      (op0==0xDu) addr = (0x800B0000u | im0) + (u32)(s16)im4;
+            else if (op0==0x9u) addr = (0x800B0000u + (u32)(s16)im0) + (u32)(s16)im4;
+          } else if (op0==0x23u && rs0==2u && rt0==2u) {
+            addr = 0x800B0000u + (u32)(s16)im0;
+          }
+          if (addr) {
+            ph = addr & 0x1FFFFFu;
+            psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr, "ADR=", addr);
+            if (ph + 3u < 0x200000u)
+              psx_log_pc(G, sendto_fn, ext->log_fd, (u8 *)ext->log_addr, "VAL=",
+                         *(u32 *)(sy->ram + ph));
           }
         }
       }

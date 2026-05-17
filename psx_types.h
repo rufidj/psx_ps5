@@ -208,6 +208,7 @@ struct psx_system {
     u32  dma_madr[8];
     u32  dma_bcr[8];
     u32  dma_chcr[8];
+    u32  dma_dpcr;
     u32  dma_dicr;
 
     /* MDEC minimal state */
@@ -222,11 +223,29 @@ struct psx_system {
     u32  mdec_data_read_pos;
     u32  mdec_in_word_count;
     u32  mdec_in_half_pos;
+    u32  mdec_output_bytes;
+    u32  mdec_decode_pending;
+    u32  mdec_worker_busy;
+    u32  mdec_worker_enabled;
     u32  mdec_log_flags;
+    u32  mdec_dma0_cnt;    /* counts DMA0 executions (one per MDEC frame decode) */
+    u32  mdec_dma1_cnt;    /* counts DMA1 executions */
+    u32  mdec_dma1_pend;   /* unused, kept for struct alignment */
     u8   mdec_iq_y[64];
     u8   mdec_iq_uv[64];
     s16  mdec_scale[64];
     u32  mdec_in_words[0x10000];
+    u8   mdec_out_buf[0x40000];
+    unsigned long mdec_thread;
+    s32  mdec_job_sema;
+    s32  mdec_done_sema;
+    void *mdec_wait_sema_fn;
+    void *mdec_signal_sema_fn;
+    void *mdec_create_sema_fn;
+    void *mdec_create_thread_fn;
+    void *mdec_attr_init_fn;
+    void *mdec_attr_setstacksize_fn;
+    void *mdec_attr_destroy_fn;
 
     /* Exception handling */
     u32  exception_vec;  /* non-zero = exception taken, skip delay slot, jump here */

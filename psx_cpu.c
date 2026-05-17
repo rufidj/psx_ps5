@@ -66,10 +66,18 @@ static void psx_cpu_log_hot_loop(struct psx_system *psx)
 {
     u32 pc = psx->pc;
     u32 ins;
-    if (psx->hot_loop_logged) return;
-    if (pc < 0x80029774u || pc > 0x8002978Cu) return;
+    u32 mask = 0;
+    if (pc >= 0x80029774u && pc <= 0x8002978Cu)
+        mask = 1u;
+    else if (pc == 0x8008B288u)
+        mask = 2u;
+    else if (pc >= 0x80087A80u && pc <= 0x80087AE0u)
+        mask = 4u;
+    else
+        return;
+    if (psx->hot_loop_logged & mask) return;
     ins = psx_bus_read(psx, pc, 4);
-    psx->hot_loop_logged = 1;
+    psx->hot_loop_logged |= mask;
     psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
                "[CPU] HL PC=", pc);
     psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
@@ -89,11 +97,28 @@ static void psx_cpu_log_hot_loop(struct psx_system *psx)
     psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
                "[CPU] HL V0=", psx->regs[2]);
     psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
+               "[CPU] HL V1=", psx->regs[3]);
+    psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
                "[CPU] HL A0=", psx->regs[4]);
+    psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
+               "[CPU] HL A1=", psx->regs[5]);
     psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
                "[CPU] HL T0=", psx->regs[8]);
     psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
                "[CPU] HL T1=", psx->regs[9]);
+    {
+        u32 rs = (ins >> 21) & 31u;
+        u32 imm = ins & 0xFFFFu;
+        u32 ea = psx->regs[rs] + (u32)(s32)(s16)imm;
+        psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
+                   "[CPU] HL RS=", rs);
+        psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
+                   "[CPU] HL EA=", ea);
+        if ((ins >> 26) == 0x24u) {
+            psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
+                       "[CPU] HL EAB=", psx_bus_read(psx, ea, 1));
+        }
+    }
     /* Log 8 words around the stuck PC for disassembly */
     for (u32 _i = 0; _i < 8u; _i++) {
         u32 _w = psx_bus_read(psx, pc + _i*4u, 4);
@@ -738,6 +763,30 @@ void psx_cpu_step(struct psx_system *psx)
     if (psx->exception_vec) {
         psx->pc = psx->exception_vec;
         return;
+    }
+
+    /* FMV wait-loop fix for Dino Crisis (0x80087A84-ADC).
+     * The loop has two exit paths:
+     *   A) sp10 < 0  (bltz at ~0x80087A9C) → JAL×3 cleanup path (SPU load, FMV done)
+     *   B) sp10 >= VBL_counter → fall-through at 0x80087ADC → 0x80087AE4 (next frame)
+     * After each MDEC frame decode (DMA1 complete, output consumed), we want path B —
+     * exit the inner wait and let the outer loop set up the next CMD1 frame.
+     * Inject sp10 = VBL_counter so the slt comparison returns 0 → path B.
+     * Do NOT inject sp10=-1 (that triggers JAL/SPU loading on every frame). */
+    if (psx->pc >= 0x80087A84u && psx->pc <= 0x80087ADCu &&
+        psx->mdec_dma1_cnt > 0u &&
+        psx->mdec_output_words == 0u &&
+        !psx->mdec_decode_pending &&
+        !psx->mdec_worker_busy) {
+        u32 _sp10_phys = (psx->regs[29] + 0x10u) & 0x1FFFFFu;
+        u32 _vbl_phys  = 0x0AC3BCu; /* 0x800AC3BC physical */
+        if (_sp10_phys + 3u < 0x200000u && _vbl_phys + 3u < 0x200000u) {
+            u32 _vbl = *(u32 *)(psx->ram + _vbl_phys);
+            u32 _cur = *(u32 *)(psx->ram + _sp10_phys);
+            /* Only inject if sp10 is not -1 (don't overwrite the real end-of-FMV signal) */
+            if (_cur != 0xFFFFFFFFu)
+                *(u32 *)(psx->ram + _sp10_phys) = _vbl;
+        }
     }
 
     u32 ins = psx_cpu_fetch(psx);

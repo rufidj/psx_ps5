@@ -26,6 +26,8 @@ static void psx_cd_fifo_sync_state(struct psx_system *psx);
 static void psx_cd_fifo_push(struct psx_system *psx, const u8 *src, u32 size);
 static u8 psx_cd_fifo_read_byte(struct psx_system *psx, int *ok);
 static u32 psx_pad_bios_dr(struct psx_system *psx);
+static void psx_cd_deliver_sector(struct psx_system *psx);
+static void dma1_exec(struct psx_system *psx);
 
 static void psx_sio_reset(struct psx_system *psx)
 {
@@ -911,7 +913,9 @@ static u32 psx_cd_hsts(const struct psx_system *psx)
     if (psx->cd_p_idx == 0) val |= 0x08u; /* PRMEMPT */
     if (psx->cd_p_idx < 16u) val |= 0x10u; /* PRMWRDY */
     if (psx->cd_resp_pos < psx->cd_resp_len) val |= 0x20u; /* RSLRRDY */
-    if ((psx->cd_req & 0x80u) && psx->cd_data_ready) val |= 0x40u; /* DRQSTS */
+    /* DRQSTS: games often poll this as soon as sector payload is queued, even
+     * before they mirror the request bit sequencing we model for FIFO reads. */
+    if (psx->cd_data_ready || psx->cd_fifo_count) val |= 0x40u;
     if (psx->cd_busy_ticks) val |= 0x80u; /* BUSYSTS */
     return val;
 }
@@ -1095,6 +1099,8 @@ static void psx_cd_exec_cmd(struct psx_system *psx, u32 cmd)
         } else {
             psx->cd_read_active = 1;
             psx->cd_seek_pending = 0;
+            psx->cd_tick_acc = 0;
+            psx_cd_deliver_sector(psx);
         }
         resp[0] = psx_cd_stat(psx);
         psx_cd_set_resp(psx, 3u, resp, 1);
@@ -1385,6 +1391,121 @@ static void psx_cd_fifo_replace_single(struct psx_system *psx, const u8 *src, u3
     psx_cd_fifo_push(psx, src, size);
 }
 
+static void psx_cd_deliver_sector(struct psx_system *psx)
+{
+    if (psx->cd_fd < 0 || !psx->kpread_fn)
+        return;
+
+    {
+        u32 lba = psx->cd_sector;
+        u32 sec_size = psx->cd_sector_size;
+        u64 off = (u64)lba * (u64)sec_size;
+        u8 *buf = psx->cd_sector_buf;
+
+        if (sec_size == 2048u) {
+            buf[0] = 0x00;
+            for (int k = 1; k < 11; k++) buf[k] = 0xFF;
+            buf[11] = 0x00;
+            {
+                u8 mm, ss, ff;
+                psx_lba_to_msf(lba, &mm, &ss, &ff);
+                buf[12] = mm; buf[13] = ss; buf[14] = ff;
+            }
+            buf[15] = 0x02;
+            for (int k = 16; k < 24; k++) buf[k] = 0;
+            NC(psx->G, psx->kpread_fn, (u64)psx->cd_fd, (u64)(buf + 24), 2048, off, 0, 0);
+            for (int k = 2072; k < 2352; k++) buf[k] = 0;
+        } else if (sec_size == 2336u) {
+            u8 mm, ss, ff;
+            buf[0] = 0x00;
+            for (int k = 1; k < 11; k++) buf[k] = 0xFF;
+            buf[11] = 0x00;
+            psx_lba_to_msf(lba, &mm, &ss, &ff);
+            buf[12] = mm; buf[13] = ss; buf[14] = ff;
+            buf[15] = 0x02;
+            if ((s32)NC(psx->G, psx->kpread_fn, (u64)psx->cd_fd, (u64)(buf + 16), 2336, off, 0, 0) != 2336) {
+                for (int k = 16; k < 2352; k++) buf[k] = 0;
+            }
+        } else {
+            NC(psx->G, psx->kpread_fn, (u64)psx->cd_fd, (u64)buf, 2352, off, 0, 0);
+        }
+
+        {
+            u8 file = 0, channel = 0, submode = 0, coding = 0;
+            psx_cd_get_subheader(psx, &file, &channel, &submode, &coding);
+            psx->cd_last_file = file;
+            psx->cd_last_channel = channel;
+            psx->cd_last_submode = submode;
+            psx->cd_last_coding = coding;
+        }
+
+        if (psx->lc_snap_lba && psx->cd_sector < psx->lc_snap_lba) {
+            psx->cd_q_lba = psx->lc_snap_lba;
+        } else {
+            psx->cd_q_lba = psx->cd_sector;
+            if (psx->lc_snap_lba) {
+                u32 idx = psx->lc_snap_idx;
+                if (idx < 64u)
+                    psx->lc_snapped[idx >> 5] |= (1u << (idx & 31u));
+                psx->lc_snap_lba = 0u;
+            }
+        }
+        psx->cd_sector++;
+
+        /* ReadS (0x1B) is used by STR/MDEC paths that expect raw sector
+         * payload in the CPU FIFO, even when the sector is real-time XA.
+         * Only divert to the XA/SPU path for non-ReadS streaming. */
+        /* After d0n>=4, log sectors with file/channel/submode to diagnose
+         * why the ISR doesn't trigger more CMD1.  Gate resets on new d0n
+         * or when the FMV exit jump resets mdec_log_flags bit 0x800.
+         * Use bits [11:4] of hot_loop_logged as 8-bit sector counter. */
+        if (psx->mdec_dma0_cnt >= 4u && psx->sendto_fn && psx->log_fd >= 0) {
+            if (!(psx->mdec_log_flags & 0x800u)) {
+                psx->mdec_log_flags |= 0x800u;
+                psx->hot_loop_logged &= 0x0Fu;  /* reset sector counter */
+            }
+            u32 _cnt = (psx->hot_loop_logged >> 4) & 0xFFu;
+            if (_cnt < 20u) {
+                psx->hot_loop_logged = (psx->hot_loop_logged & 0x0Fu) | ((_cnt+1u) << 4);
+                psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
+                           "[SEC] lba=", psx->cd_sector - 1u);
+                psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
+                           "[SEC] fc=", ((u32)psx->cd_last_file << 8) | psx->cd_last_channel);
+                psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
+                           "[SEC] sm=", (u32)psx->cd_last_submode);
+                psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
+                           "[SEC] filt=", ((u32)psx->cd_filter_file << 8) | psx->cd_filter_channel);
+            }
+        }
+
+        if (psx->cd_read_cmd != 0x1Bu &&
+            (psx->cd_mode & 0x40u) &&
+            psx_cd_is_xa_audio_rt(psx)) {
+            psx_cd_fifo_sync_state(psx);
+        } else {
+            u32 skip = psx_cd_data_skip(psx);
+            u32 limit = psx_cd_data_limit(psx);
+            if (psx->cd_read_cmd == 0x1Bu)
+                psx_cd_fifo_push(psx, buf + skip, limit);
+            else
+                psx_cd_fifo_replace_single(psx, buf + skip, limit);
+        }
+
+        {
+            u8 rstat = psx_cd_stat(psx);
+            psx_cd_set_resp(psx, 1u, &rstat, 1);
+            if (psx->cd_pause_pending) {
+                psx->cd_pause_pending = 0;
+                psx->cd_read_cmd = 0;
+                psx->cd_read_active = 0;
+                psx->cd_read_after_seek = 0;
+                rstat = psx_cd_stat(psx);
+                psx_cd_set_second_resp(psx, 2u, &rstat, 1, 0);
+            }
+        }
+    }
+}
+
 static u8 psx_cd_fifo_read_byte(struct psx_system *psx, int *ok)
 {
     u32 idx;
@@ -1431,12 +1552,11 @@ static void psx_dma_recalc_dicr(struct psx_system *psx)
 
 static void psx_dma_complete_channel(struct psx_system *psx, u32 ch)
 {
-    u32 old_master = psx->dma_dicr & 0x80000000u;
     psx->dma_chcr[ch & 7u] &= ~(1u << 24);
     if (psx->dma_dicr & (1u << (16u + (ch & 7u))))
         psx->dma_dicr |= (1u << (24u + (ch & 7u)));
     psx_dma_recalc_dicr(psx);
-    if (!old_master && (psx->dma_dicr & 0x80000000u))
+    if (psx->dma_dicr & 0x80000000u)
         psx->i_stat |= (1u << 3);
 }
 
@@ -1529,6 +1649,67 @@ static void psx_mdec_write_u32_ram(struct psx_system *psx, u32 *addr, u32 val)
     *addr = (a + 4u) & 0x1FFFFCu;
 }
 
+static u32 psx_bus_io_read_part32(u32 reg, u32 phys, u32 base, int width)
+{
+    u32 shift = (phys - base) * 8u;
+    if (width == 1)
+        return (reg >> shift) & 0xFFu;
+    if (width == 2)
+        return (reg >> shift) & 0xFFFFu;
+    return reg;
+}
+
+static u32 psx_bus_io_merge_part32(u32 old_reg, u32 val, u32 phys, u32 base, int width)
+{
+    u32 shift = (phys - base) * 8u;
+    u32 mask = (width == 1) ? 0xFFu : ((width == 2) ? 0xFFFFu : 0xFFFFFFFFu);
+    return (old_reg & ~(mask << shift)) | ((val & mask) << shift);
+}
+
+static u32 *psx_bus_dma_reg_ptr(struct psx_system *psx, u32 phys, u32 *base_out)
+{
+    u32 base = phys & ~3u;
+    if (base_out)
+        *base_out = base;
+
+    switch (base) {
+    case 0x1F801080u: return &psx->dma_madr[0];
+    case 0x1F801084u: return &psx->dma_bcr[0];
+    case 0x1F801088u: return &psx->dma_chcr[0];
+    case 0x1F801090u: return &psx->dma_madr[1];
+    case 0x1F801094u: return &psx->dma_bcr[1];
+    case 0x1F801098u: return &psx->dma_chcr[1];
+    case 0x1F8010A0u: return &psx->dma_madr[2];
+    case 0x1F8010A4u: return &psx->dma_bcr[2];
+    case 0x1F8010A8u: return &psx->dma_chcr[2];
+    case 0x1F8010B0u: return &psx->dma_madr[3];
+    case 0x1F8010B4u: return &psx->dma_bcr[3];
+    case 0x1F8010B8u: return &psx->dma_chcr[3];
+    case 0x1F8010C0u: return &psx->dma_madr[4];
+    case 0x1F8010C4u: return &psx->dma_bcr[4];
+    case 0x1F8010C8u: return &psx->dma_chcr[4];
+    case 0x1F8010E0u: return &psx->dma_madr[6];
+    case 0x1F8010E4u: return &psx->dma_bcr[6];
+    case 0x1F8010E8u: return &psx->dma_chcr[6];
+    case 0x1F8010F0u: return &psx->dma_dpcr;
+    case 0x1F8010F4u: return &psx->dma_dicr;
+    default: return 0;
+    }
+}
+
+static u32 psx_mdec_trim_padding(const u16 *src, u32 pos, u32 total_halfwords)
+{
+    while (pos < total_halfwords) {
+        u16 hw = src[pos];
+        if (hw == 0xFE00u || hw == 0x0000u) {
+            pos++;
+            continue;
+        }
+        break;
+    }
+    return pos;
+}
+
 static void psx_mdec_init_defaults(struct psx_system *psx)
 {
     for (u32 i = 0; i < 64u; i++) {
@@ -1536,6 +1717,14 @@ static void psx_mdec_init_defaults(struct psx_system *psx)
         psx->mdec_iq_uv[i] = 1u;
         psx->mdec_scale[i] = psx_mdec_default_scale[i];
     }
+}
+
+static void psx_mdec_zero_output(struct psx_system *psx)
+{
+    psx->mdec_output_ready = 0;
+    psx->mdec_output_words = 0;
+    psx->mdec_output_bytes = 0;
+    psx->mdec_data_read_pos = 0;
 }
 
 static void psx_mdec_update_status(struct psx_system *psx)
@@ -1557,7 +1746,8 @@ static void psx_mdec_update_status(struct psx_system *psx)
     if (remaining != 0)
         st |= 1u << 30;
     /* Bit 29: Busy — set while actively receiving parameter words OR output pending */
-    if (remaining != 0 || psx->mdec_output_ready)
+    if (remaining != 0 || psx->mdec_output_ready ||
+        psx->mdec_decode_pending || psx->mdec_worker_busy)
         st |= 1u << 29;
     if (psx->mdec_in_enabled)
         st |= 1u << 28;
@@ -1578,17 +1768,43 @@ static void psx_mdec_update_status(struct psx_system *psx)
 
 static void psx_mdec_reset(struct psx_system *psx)
 {
+    unsigned long saved_thread = psx->mdec_thread;
+    s32 saved_job_sema = psx->mdec_job_sema;
+    s32 saved_done_sema = psx->mdec_done_sema;
+    u32 saved_worker_enabled = psx->mdec_worker_enabled;
+    void *saved_wait = psx->mdec_wait_sema_fn;
+    void *saved_signal = psx->mdec_signal_sema_fn;
+    void *saved_create_sema = psx->mdec_create_sema_fn;
+    void *saved_create_thread = psx->mdec_create_thread_fn;
+    void *saved_attr_init = psx->mdec_attr_init_fn;
+    void *saved_attr_setstacksize = psx->mdec_attr_setstacksize_fn;
+    void *saved_attr_destroy = psx->mdec_attr_destroy_fn;
+
     psx->mdec_ctrl = 0;
     psx->mdec_cmd = 0;
     psx->mdec_words_remaining = 0;
     psx->mdec_in_enabled = 0;
     psx->mdec_out_enabled = 0;
-    psx->mdec_output_ready = 0;
-    psx->mdec_output_words = 0;
-    psx->mdec_data_read_pos = 0;
+    psx_mdec_zero_output(psx);
     psx->mdec_in_word_count = 0;
     psx->mdec_in_half_pos = 0;
+    psx->mdec_decode_pending = 0;
+    psx->mdec_worker_busy = 0;
+    psx->mdec_worker_enabled = saved_worker_enabled;
+    psx->mdec_thread = saved_thread;
+    psx->mdec_job_sema = saved_job_sema;
+    psx->mdec_done_sema = saved_done_sema;
+    psx->mdec_wait_sema_fn = saved_wait;
+    psx->mdec_signal_sema_fn = saved_signal;
+    psx->mdec_create_sema_fn = saved_create_sema;
+    psx->mdec_create_thread_fn = saved_create_thread;
+    psx->mdec_attr_init_fn = saved_attr_init;
+    psx->mdec_attr_setstacksize_fn = saved_attr_setstacksize;
+    psx->mdec_attr_destroy_fn = saved_attr_destroy;
     psx->mdec_log_flags = 0;
+    psx->mdec_dma0_cnt = 0;
+    psx->mdec_dma1_cnt = 0;
+    psx->mdec_dma1_pend = 0;
     psx_mdec_init_defaults(psx);
     psx->mdec_status = 0x80040000u;
 }
@@ -1612,18 +1828,20 @@ static void psx_mdec_write_command(struct psx_system *psx, u32 val)
         }
         psx->mdec_in_word_count = 0;
         psx->mdec_in_half_pos = 0;
-        psx->mdec_output_ready = 0;
-        psx->mdec_output_words = 0;
-        psx->mdec_data_read_pos = 0;
+        psx_mdec_zero_output(psx);
+        psx->mdec_decode_pending = 0;
+        psx->mdec_worker_busy = 0;
         /* Log each command type with separate flag bits:
          * bit 0x01 = first CMD2/3 (table load) seen
          * bit 0x10 = first CMD1 (decode) seen
          * bit 0x02 = DMA0 seen (used in dma0_exec)
          * bit 0x04 = DMA1 seen (used in dma1_exec) */
         if (cmd == 1u) {
+            /* Reset decode-cycle log flags so the 2nd+ frame can be logged too */
+            psx->mdec_log_flags &= ~(0x10u | 0x20u | 0x40u | 0x80u | 0x100u | 0x200u);
+            psx->mdec_dma1_cnt = 0;  /* reset DMA1 counter per frame */
             if (!(psx->mdec_log_flags & 0x10u) && psx->sendto_fn && psx->log_fd >= 0) {
                 psx->mdec_log_flags |= 0x10u;
-                psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr, "[MDEC] CMD1 decode=", val);
                 psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr, "[MDEC] CMD1 depth=", (val >> 27) & 3u);
                 psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr, "[MDEC] CMD1 words=", psx->mdec_words_remaining);
             }
@@ -1880,23 +2098,229 @@ static void psx_mdec_compact_input(struct psx_system *psx)
     }
 }
 
+static u32 psx_mdec_macroblock_max_bytes(u32 depth)
+{
+    if (depth == 2u)
+        return 768u;
+    if (depth == 3u)
+        return 512u;
+    if (depth == 1u)
+        return 64u;
+    return 32u;
+}
+
+static void psx_mdec_decode_into_output(struct psx_system *psx)
+{
+    const u16 *src = (const u16 *)psx->mdec_in_words;
+    u32 total_halfwords = psx->mdec_in_word_count * 2u;
+    u32 depth = (psx->mdec_cmd >> 27) & 3u;
+    u32 max_mb_bytes = psx_mdec_macroblock_max_bytes(depth);
+    u32 out_pos = 0;
+    u32 macroblocks = 0;
+
+    psx_mdec_zero_output(psx);
+
+    while (psx->mdec_in_half_pos < total_halfwords) {
+        u32 saved_pos = psx->mdec_in_half_pos;
+        u8 macroblock[768];
+        u32 out_bytes = 0;
+        u32 padded_bytes;
+
+        if (out_pos + max_mb_bytes > sizeof(psx->mdec_out_buf))
+            break;
+
+        if (depth == 2u || depth == 3u)
+            psx_mdec_decode_colored_macroblock(psx, macroblock, &out_bytes);
+        else
+            psx_mdec_decode_monochrome_macroblock(psx, macroblock, &out_bytes);
+
+        if (!out_bytes) {
+            if (!(psx->mdec_log_flags & 0x20u) && psx->sendto_fn && psx->log_fd >= 0) {
+                psx->mdec_log_flags |= 0x20u;
+                psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
+                           "[MDEC] decode_fail_pos=", saved_pos);
+                psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
+                           "[MDEC] decode_fail_total=", total_halfwords);
+                if (saved_pos < total_halfwords) {
+                    psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
+                               "[MDEC] decode_fail_hw=", src[saved_pos]);
+                }
+            }
+            psx->mdec_in_half_pos = saved_pos;
+            break;
+        }
+
+        padded_bytes = (out_bytes + 3u) & ~3u;
+        if (out_pos + padded_bytes > sizeof(psx->mdec_out_buf)) {
+            psx->mdec_in_half_pos = saved_pos;
+            break;
+        }
+
+        for (u32 i = 0; i < out_bytes; i++)
+            psx->mdec_out_buf[out_pos + i] = macroblock[i];
+        while (out_bytes < padded_bytes)
+            psx->mdec_out_buf[out_pos + out_bytes++] = 0;
+        out_pos += padded_bytes;
+        macroblocks++;
+    }
+
+    psx->mdec_in_half_pos = psx_mdec_trim_padding(src, psx->mdec_in_half_pos, total_halfwords);
+    psx->mdec_output_bytes = out_pos;
+    psx->mdec_output_words = out_pos >> 2;
+    psx->mdec_output_ready = (psx->mdec_output_words != 0u);
+    psx->mdec_decode_pending = (psx->mdec_in_half_pos < total_halfwords);
+    if (!psx->mdec_decode_pending) {
+        psx->mdec_in_word_count = 0;
+        psx->mdec_in_half_pos = 0;
+    }
+    if (!(psx->mdec_log_flags & 0x40u) && psx->sendto_fn && psx->log_fd >= 0) {
+        psx->mdec_log_flags |= 0x40u;
+        psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
+                   "[MDEC] mb=", macroblocks);
+        psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
+                   "[MDEC] words=", psx->mdec_output_words);
+    }
+    psx_mdec_update_status(psx);
+    /* If DMA1 was deferred waiting for this decode, re-trigger it now.
+     * Safe to call here because:
+     *   - if called from dma0_exec path: not inside dma1_exec, no recursion
+     *   - if called from worker thread: output_ready=1, dma1_exec runs fully
+     *   - dma1_exec clears mdec_dma1_pend before returning */
+    if (psx->mdec_dma1_pend && psx->mdec_output_ready)
+        dma1_exec(psx);
+}
+
+static void psx_mdec_kick_worker(struct psx_system *psx)
+{
+    if (!psx->mdec_worker_enabled || !psx->mdec_signal_sema_fn ||
+        psx->mdec_job_sema < 0)
+        return;
+    if (psx->mdec_worker_busy || psx->mdec_output_ready || !psx->mdec_decode_pending)
+        return;
+    psx->mdec_worker_busy = 1;
+    psx_mdec_update_status(psx);
+    NC(psx->G, psx->mdec_signal_sema_fn, (u64)psx->mdec_job_sema, 1, 0, 0, 0, 0);
+}
+
+static void psx_mdec_ensure_output(struct psx_system *psx)
+{
+    if (psx->mdec_output_ready || !psx->mdec_decode_pending)
+        return;
+
+    if (psx->mdec_worker_enabled && psx->mdec_wait_sema_fn &&
+        psx->mdec_done_sema >= 0) {
+        psx_mdec_kick_worker(psx);
+        if (psx->mdec_worker_busy)
+            NC(psx->G, psx->mdec_wait_sema_fn, (u64)psx->mdec_done_sema, 1, 0, 0, 0, 0);
+        if (!psx->mdec_output_ready && psx->mdec_decode_pending) {
+            if (!(psx->mdec_log_flags & 0x80u) && psx->sendto_fn && psx->log_fd >= 0) {
+                psx->mdec_log_flags |= 0x80u;
+                psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
+                           "[MDEC] worker_no_output=", psx->mdec_worker_busy);
+            }
+            psx_mdec_decode_into_output(psx);
+        }
+    } else {
+        psx_mdec_decode_into_output(psx);
+    }
+}
+
+static u32 psx_mdec_pop_output_word(struct psx_system *psx)
+{
+    u32 pos;
+    u32 v = 0;
+
+    psx_mdec_ensure_output(psx);
+    if (!psx->mdec_output_ready || !psx->mdec_output_words)
+        return 0;
+
+    pos = psx->mdec_data_read_pos * 4u;
+    if (pos + 0u < psx->mdec_output_bytes) v |= (u32)psx->mdec_out_buf[pos + 0u];
+    if (pos + 1u < psx->mdec_output_bytes) v |= (u32)psx->mdec_out_buf[pos + 1u] << 8;
+    if (pos + 2u < psx->mdec_output_bytes) v |= (u32)psx->mdec_out_buf[pos + 2u] << 16;
+    if (pos + 3u < psx->mdec_output_bytes) v |= (u32)psx->mdec_out_buf[pos + 3u] << 24;
+
+    psx->mdec_data_read_pos++;
+    if (psx->mdec_data_read_pos >= psx->mdec_output_words) {
+        psx_mdec_zero_output(psx);
+        if (psx->mdec_decode_pending)
+            psx_mdec_kick_worker(psx);
+        psx_mdec_update_status(psx);
+    }
+    return v;
+}
+
+static void *psx_mdec_worker_thread(void *arg)
+{
+    struct psx_system *psx = (struct psx_system *)arg;
+
+    for (;;) {
+        if (!psx || !psx->mdec_wait_sema_fn)
+            return 0;
+        NC(psx->G, psx->mdec_wait_sema_fn, (u64)psx->mdec_job_sema, 1, 0, 0, 0, 0);
+        psx_mdec_decode_into_output(psx);
+        psx->mdec_worker_busy = 0;
+        psx_mdec_update_status(psx);
+        if (psx->mdec_signal_sema_fn && psx->mdec_done_sema >= 0)
+            NC(psx->G, psx->mdec_signal_sema_fn, (u64)psx->mdec_done_sema, 1, 0, 0, 0, 0);
+    }
+}
+
+static int psx_mdec_thread_init(struct psx_system *psx)
+{
+    unsigned long thread = 0;
+    unsigned long attr[14];
+    s32 job_sema, done_sema, tret;
+
+    if (!psx->mdec_create_sema_fn || !psx->mdec_wait_sema_fn ||
+        !psx->mdec_signal_sema_fn || !psx->mdec_create_thread_fn)
+        return 0;
+
+    job_sema = (s32)NC(psx->G, psx->mdec_create_sema_fn, (u64)"psx_mdec_job", 0, 0, 1024, 0, 0);
+    done_sema = (s32)NC(psx->G, psx->mdec_create_sema_fn, (u64)"psx_mdec_done", 0, 0, 1024, 0, 0);
+    if (job_sema < 0 || done_sema < 0)
+        return 0;
+
+    psx->mdec_job_sema = job_sema;
+    psx->mdec_done_sema = done_sema;
+
+    for (u32 i = 0; i < sizeof(attr) / sizeof(unsigned long); i++)
+        attr[i] = 0;
+    if (psx->mdec_attr_init_fn)
+        NC(psx->G, psx->mdec_attr_init_fn, (u64)attr, 0, 0, 0, 0, 0);
+    if (psx->mdec_attr_setstacksize_fn)
+        NC(psx->G, psx->mdec_attr_setstacksize_fn, (u64)attr, 0x10000, 0, 0, 0, 0);
+
+    tret = (s32)NC(psx->G, psx->mdec_create_thread_fn, (u64)&thread, (u64)attr,
+                   (u64)psx_mdec_worker_thread, (u64)psx, (u64)"psx_mdec", 0);
+    if (psx->mdec_attr_destroy_fn)
+        NC(psx->G, psx->mdec_attr_destroy_fn, (u64)attr, 0, 0, 0, 0, 0);
+    if (tret != 0)
+        return 0;
+
+    psx->mdec_thread = thread;
+    psx->mdec_worker_enabled = 1;
+    return 1;
+}
+
 static void dma0_exec(struct psx_system *psx)
 {
     u32 addr = psx->dma_madr[0] & 0x1FFFFCu;
     u32 words_per_block = psx->dma_bcr[0] & 0xFFFFu;
     u32 block_count = (psx->dma_bcr[0] >> 16) & 0xFFFFu;
     u32 words = words_per_block;
+    u32 d0 = psx->mdec_dma0_cnt;
 
     if (!words_per_block)
         words_per_block = 0x10000u;
     if (!block_count)
         block_count = 1u;
     words = words_per_block * block_count;
+    psx->mdec_dma0_cnt++;
 
-    if (!(psx->mdec_log_flags & 2u) && psx->sendto_fn && psx->log_fd >= 0) {
-        psx->mdec_log_flags |= 2u;
+    if (d0 < 10u && psx->sendto_fn && psx->log_fd >= 0) {
+        psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr, "[MDEC] DMA0#=", d0);
         psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr, "[MDEC] DMA0 bcr=", psx->dma_bcr[0]);
-        psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr, "[MDEC] DMA0 chcr=", psx->dma_chcr[0]);
     }
 
     for (u32 i = 0; i < words; i++) {
@@ -1921,11 +2345,44 @@ static void dma0_exec(struct psx_system *psx)
     else if ((psx->mdec_cmd >> 29) == 3u)
         psx_mdec_commit_scale_table(psx);
 
-    /* After loading all payload words for a CMD1 (decode), mark output
-     * ready so DMA1 knows it can start pulling decoded macroblocks. */
     if ((psx->mdec_cmd >> 29) == 1u && psx->mdec_words_remaining == 0u) {
-        psx->mdec_output_ready  = 1;
-        psx->mdec_data_read_pos = 0;
+        psx->mdec_decode_pending = (psx->mdec_in_word_count != 0u);
+        psx->mdec_in_half_pos = 0;
+        if (psx->mdec_output_words == 0u) {
+            /* Output buffer empty — decode immediately */
+            psx_mdec_zero_output(psx);
+            psx_mdec_kick_worker(psx);
+            if (!psx->mdec_worker_enabled)
+                psx_mdec_decode_into_output(psx);
+        }
+        /* else: previous frame output still being consumed by DMA1.
+         * Defer decode — psx_mdec_ensure_output() in dma1_exec will fire it
+         * once DMA1 exhausts the current output (pipelined MDEC support). */
+    } else if ((psx->mdec_cmd >> 29) == 1u && psx->mdec_words_remaining > 0u &&
+               psx->mdec_in_word_count > 0u) {
+        /* CMD1 word count was larger than actual data sent.
+         * Force-complete the decode with whatever data arrived. */
+        if (psx->sendto_fn && psx->log_fd >= 0)
+            psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
+                       "[MDEC] force_dec rem=", psx->mdec_words_remaining);
+        psx->mdec_words_remaining = 0u;
+        psx->mdec_decode_pending  = 1u;
+        psx->mdec_in_half_pos     = 0;
+        if (psx->mdec_output_words == 0u) {
+            psx_mdec_zero_output(psx);
+            psx_mdec_kick_worker(psx);
+            if (!psx->mdec_worker_enabled)
+                psx_mdec_decode_into_output(psx);
+        }
+        /* else: defer */
+    }
+
+    /* Log post-DMA0 MDEC state for first 10 DMA0 executions */
+    if (d0 < 10u && psx->sendto_fn && psx->log_fd >= 0) {
+        psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
+                   "[MDEC] D0rem=", psx->mdec_words_remaining);
+        psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
+                   "[MDEC] D0ow=", psx->mdec_output_words);
     }
 
     psx->dma_madr[0] = addr;
@@ -1938,38 +2395,30 @@ static void dma1_exec(struct psx_system *psx)
     u32 words_per_block = psx->dma_bcr[1] & 0xFFFFu;
     u32 block_count = (psx->dma_bcr[1] >> 16) & 0xFFFFu;
     u32 words = words_per_block;
+    u32 cur = psx->mdec_dma1_cnt;
 
     if (!words_per_block)
         words_per_block = 0x10000u;
     if (!block_count)
         block_count = 1u;
     words = words_per_block * block_count;
+    psx->mdec_dma1_cnt++;
 
-    if (!(psx->mdec_log_flags & 4u) && psx->sendto_fn && psx->log_fd >= 0) {
-        psx->mdec_log_flags |= 4u;
+    /* Log only first DMA1 execution */
+    if (cur == 0u && psx->sendto_fn && psx->log_fd >= 0) {
         psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr, "[MDEC] DMA1 bcr=", psx->dma_bcr[1]);
-        psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr, "[MDEC] DMA1 chcr=", psx->dma_chcr[1]);
         psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr, "[MDEC] DMA1 madr=", psx->dma_madr[1]);
-        psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr, "[MDEC] in_words=", psx->mdec_in_word_count);
+        psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr, "[MDEC] D1ow=", psx->mdec_output_words);
     }
 
     if ((psx->mdec_cmd >> 29) == 1u) {
         u32 remaining_words = words;
         while (remaining_words) {
-            u8 out[768];
-            u32 out_bytes = 0;
-            u32 out_words;
-            u32 depth = (psx->mdec_cmd >> 27) & 3u;
-
-            if (depth == 2u || depth == 3u)
-                psx_mdec_decode_colored_macroblock(psx, out, &out_bytes);
-            else
-                psx_mdec_decode_monochrome_macroblock(psx, out, &out_bytes);
-
-            if (!out_bytes) {
-                /* MDEC decode not implemented: output black (zeros) for
-                 * this macroblock so DMA1 completes and the game advances.
-                 * FMV plays as black frames until MDEC is rewritten. */
+            psx_mdec_ensure_output(psx);
+            if (!psx->mdec_output_ready) {
+                /* No output available — write zeros so the game gets its DMA1 IRQ.
+                 * The game double-buffers: it re-arms DMA1 2×N times for N batches,
+                 * and needs all IRQs to count the transfer complete. */
                 while (remaining_words) {
                     psx_mdec_write_u32_ram(psx, &addr, 0u);
                     remaining_words--;
@@ -1977,31 +2426,23 @@ static void dma1_exec(struct psx_system *psx)
                 break;
             }
 
-            out_words = (out_bytes + 3u) >> 2;
-            for (u32 i = 0; i < out_words && remaining_words; i++) {
-                u32 v = 0;
-                u32 base = i * 4u;
-                if (base + 0u < out_bytes) v |= (u32)out[base + 0u];
-                if (base + 1u < out_bytes) v |= (u32)out[base + 1u] << 8;
-                if (base + 2u < out_bytes) v |= (u32)out[base + 2u] << 16;
-                if (base + 3u < out_bytes) v |= (u32)out[base + 3u] << 24;
-                psx_mdec_write_u32_ram(psx, &addr, v);
+            while (remaining_words && psx->mdec_output_ready) {
+                psx_mdec_write_u32_ram(psx, &addr, psx_mdec_pop_output_word(psx));
                 remaining_words--;
             }
-
-            if (out_words == 0u)
-                break;
         }
-        psx_mdec_compact_input(psx);
     } else {
         for (u32 i = 0; i < words; i++)
             psx_mdec_write_u32_ram(psx, &addr, 0u);
     }
 
-    psx->mdec_output_ready = 0;
-    psx->mdec_output_words = 0;
-    psx->mdec_data_read_pos = 0;
     psx->dma_madr[1] = addr;
+    if (cur == 0u && psx->sendto_fn && psx->log_fd >= 0) {
+        psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
+                   "[MDEC] D1done=", words);
+        psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
+                   "[MDEC] D1rp=", psx->mdec_data_read_pos);
+    }
     psx_mdec_update_status(psx);
     psx_dma_complete_channel(psx, 1u);
 }
@@ -2131,23 +2572,48 @@ u32 psx_bus_read(struct psx_system *psx, u32 addr, int width)
     }
     /* I/O */
     if (phys >= ADDR_IO && phys < 0x1F802000u) {
+        u32 dma_base = 0;
+        u32 *dma_reg = 0;
+        if (phys >= 0x1F801080u && phys <= 0x1F8010F7u) {
+            dma_reg = psx_bus_dma_reg_ptr(psx, phys, &dma_base);
+            if (dma_reg) {
+                u32 v = psx_bus_io_read_part32(*dma_reg, phys, dma_base, width);
+                if (!(psx->mdec_log_flags & 0x400u) && psx->pc == 0x8008B288u &&
+                    psx->sendto_fn && psx->log_fd >= 0) {
+                    psx->mdec_log_flags |= 0x400u;
+                    psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
+                               "[DMA] loop_read_addr=", phys);
+                    psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
+                               "[DMA] loop_read_base=", dma_base);
+                    psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
+                               "[DMA] loop_read_val=", v);
+                    psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
+                               "[DMA] loop_reg32=", *dma_reg);
+                }
+                return v;
+            }
+        }
         switch (phys) {
         /* Interrupt */
         case 0x1F801070: return psx->i_stat;
         case 0x1F801074: return psx->i_mask;
         /* MDEC */
         case 0x1F801820:
-            if (psx->mdec_output_ready) {
-                psx->mdec_data_read_pos++;
-                if (psx->mdec_output_words && psx->mdec_data_read_pos >= psx->mdec_output_words) {
-                    psx->mdec_output_ready = 0;
-                    psx->mdec_data_read_pos = 0;
-                    psx_mdec_update_status(psx);
-                }
-            }
-            return 0;
+            return psx_mdec_pop_output_word(psx);
         case 0x1F801824:
             psx_mdec_update_status(psx);
+            if (!(psx->mdec_log_flags & 0x200u) && psx->pc == 0x8008B288u &&
+                psx->sendto_fn && psx->log_fd >= 0) {
+                psx->mdec_log_flags |= 0x200u;
+                psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
+                           "[MDEC] stat_read_pc=", psx->pc);
+                psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
+                           "[MDEC] stat_read=", psx->mdec_status);
+                psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
+                           "[MDEC] out_ready=", psx->mdec_output_ready);
+                psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
+                           "[MDEC] out_words2=", psx->mdec_output_words);
+            }
             return psx->mdec_status;
         /* GPU */
         case 0x1F801810: return psx_gpu_vram_read_word(psx);
@@ -2218,7 +2684,7 @@ u32 psx_bus_read(struct psx_system *psx, u32 addr, int width)
         case 0x1F8010E4: return psx->dma_bcr[6];
         case 0x1F8010E8: return psx->dma_chcr[6];
         /* DMA control */
-        case 0x1F8010F0: return 0x07654321u; /* DPCR – all channels enabled */
+        case 0x1F8010F0: return psx->dma_dpcr;
         case 0x1F8010F4: return psx->dma_dicr;
         /* SPU */
         case 0x1F801DAA: return psx->spu_regs[SPU_REG_CTRL]; /* SPUCNT */
@@ -2266,6 +2732,21 @@ void psx_bus_write(struct psx_system *psx, u32 addr, u32 val, int width)
     }
     /* I/O */
     if (phys >= ADDR_IO && phys < 0x1F802000u) {
+        if (phys >= 0x1F8010F0u && phys <= 0x1F8010F3u) {
+            psx->dma_dpcr = psx_bus_io_merge_part32(psx->dma_dpcr, val, phys, 0x1F8010F0u, width);
+            return;
+        }
+        if (phys >= 0x1F8010F4u && phys <= 0x1F8010F7u && phys != 0x1F8010F4u) {
+            u32 merged = psx_bus_io_merge_part32(psx->dma_dicr, val, phys, 0x1F8010F4u, width);
+            psx->dma_dicr &= ~(merged & 0x7F000000u); /* write-1-to-ack flags */
+            psx->dma_dicr = (psx->dma_dicr & 0xFF00FFFFu) | (merged & 0x00FF8000u);
+            psx_dma_recalc_dicr(psx);
+            if (psx->dma_dicr & 0x80000000u)
+                psx->i_stat |= (1u << 3);
+            else
+                psx->i_stat &= ~(1u << 3);
+            return;
+        }
         switch (phys) {
         case 0x1F801070: psx->i_stat &= val; break;
         case 0x1F801074: psx->i_mask  = val; break;
@@ -2336,12 +2817,10 @@ void psx_bus_write(struct psx_system *psx, u32 addr, u32 val, int width)
         case 0x1F801098:
             psx->dma_chcr[1] = val;
             if (val & (1u << 24)) {
-                psx->mdec_output_words = (psx->dma_bcr[1] & 0xFFFFu) *
-                                         (((psx->dma_bcr[1] >> 16) & 0xFFFFu) ? ((psx->dma_bcr[1] >> 16) & 0xFFFFu) : 1u);
-                if (!psx->mdec_output_words)
-                    psx->mdec_output_words = 0x10000u;
-                psx->mdec_output_ready = 1;
-                psx_mdec_update_status(psx);
+                /* Log first re-arm only */
+                if (psx->mdec_dma1_cnt == 1u && psx->sendto_fn && psx->log_fd >= 0)
+                    psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
+                               "[MDEC] D1arm1 madr=", psx->dma_madr[1]);
                 dma1_exec(psx);
             }
             break;
@@ -2390,6 +2869,9 @@ void psx_bus_write(struct psx_system *psx, u32 addr, u32 val, int width)
                     psx->cd_resp_len = 0;
                 }
                 if (val & 0x80u) { /* CHPRST */
+                    if (psx->cd_read_active && psx->sendto_fn && psx->log_fd >= 0)
+                        psx_log_pc(psx->G, psx->sendto_fn, psx->log_fd, psx->log_addr,
+                                   "[CD] CHPRST during read! sec=", psx->cd_sector);
                     psx->cd_req = 0;
                     psx->cd_read_active = 0;
                     psx->cd_pause_pending = 0;
@@ -2476,10 +2958,17 @@ void psx_bus_write(struct psx_system *psx, u32 addr, u32 val, int width)
             psx->dma_chcr[6] = val;
             if (val & (1u << 24)) dma6_exec(psx);
             break;
+        case 0x1F8010F0:
+            psx->dma_dpcr = val;
+            break;
         case 0x1F8010F4:
             psx->dma_dicr &= ~(val & 0x7F000000u); /* write-1-to-ack flags */
             psx->dma_dicr = (psx->dma_dicr & 0xFF00FFFFu) | (val & 0x00FF8000u);
             psx_dma_recalc_dicr(psx);
+            if (psx->dma_dicr & 0x80000000u)
+                psx->i_stat |= (1u << 3);
+            else
+                psx->i_stat &= ~(1u << 3);
             break;
         case 0x1F801D88: /* Key On (0-23) */
             psx_spu_key_on_mask(psx, val);
@@ -2590,6 +3079,7 @@ void psx_bus_tick(struct psx_system *psx, u32 cycles)
             psx->cd_seek_pending = 0;
             psx->cd_read_after_seek = 0;
             psx->cd_read_active = 1;
+            psx_cd_deliver_sector(psx);
         }
     }
 
@@ -2602,94 +3092,7 @@ void psx_bus_tick(struct psx_system *psx, u32 cycles)
         
         if (psx->cd_tick_acc >= threshold) {
             psx->cd_tick_acc = 0;
-            if (psx->cd_fd >= 0 && psx->kpread_fn) {
-                u32 lba = psx->cd_sector;
-                u32 sec_size = psx->cd_sector_size;
-                u64 off = (u64)lba * (u64)sec_size;
-
-                u8 *buf = psx->cd_sector_buf;
-                if (sec_size == 2048) {
-                    /* ISO image: Synthesize RAW header */
-                    buf[0] = 0x00; for(int k=1; k<11; k++) buf[k] = 0xFF; buf[11] = 0x00;
-                    u8 mm, ss, ff;
-                    psx_lba_to_msf(lba, &mm, &ss, &ff);
-                    buf[12] = mm; buf[13] = ss; buf[14] = ff;
-                    buf[15] = 0x02;
-                    for(int k=16; k<24; k++) buf[k] = 0;
-                    NC(psx->G, psx->kpread_fn, (u64)psx->cd_fd, (u64)(buf + 24), 2048, off, 0, 0);
-                    for(int k=2072; k<2352; k++) buf[k] = 0;
-                } else if (sec_size == 2336) {
-                    u8 mm, ss, ff;
-                    buf[0] = 0x00; for(int k=1; k<11; k++) buf[k] = 0xFF; buf[11] = 0x00;
-                    psx_lba_to_msf(lba, &mm, &ss, &ff);
-                    buf[12] = mm; buf[13] = ss; buf[14] = ff;
-                    buf[15] = 0x02;
-                    if ((s32)NC(psx->G, psx->kpread_fn, (u64)psx->cd_fd, (u64)(buf + 16), 2336, off, 0, 0) != 2336) {
-                        for(int k=16; k<2352; k++) buf[k] = 0;
-                    }
-                } else {
-                    NC(psx->G, psx->kpread_fn, (u64)psx->cd_fd, (u64)buf, 2352, off, 0, 0);
-                }
-
-                {
-                    u8 file = 0, channel = 0, submode = 0, coding = 0;
-                    psx_cd_get_subheader(psx, &file, &channel, &submode, &coding);
-                    psx->cd_last_file = file;
-                    psx->cd_last_channel = channel;
-                    psx->cd_last_submode = submode;
-                    psx->cd_last_coding = coding;
-                }
-
-                /* LibCrypt snap: hold cd_q_lba at the snap target until the drive
-                 * physically delivers that sector; when it clears, mark it snapped
-                 * so the next SetLoc in the same area snaps to the NEXT LC sector. */
-                if (psx->lc_snap_lba && psx->cd_sector < psx->lc_snap_lba) {
-                    psx->cd_q_lba = psx->lc_snap_lba;
-                } else {
-                    psx->cd_q_lba = psx->cd_sector;
-                    if (psx->lc_snap_lba) {
-                        /* mark this entry as snapped so we advance to the next one */
-                        u32 idx = psx->lc_snap_idx;
-                        if (idx < 64u)
-                            psx->lc_snapped[idx >> 5] |= (1u << (idx & 31u));
-                        psx->lc_snap_lba = 0u;
-                    }
-                }
-                psx->cd_sector++;
-
-                /* XA audio sectors inside interleaved STR/XA streams must not be
-                 * fed to the CPU data FIFO. Real hardware routes them to the XA
-                 * decoder/SPU path when XA is enabled. Delivering them as plain
-                 * data corrupts FMV/MDEC streams that are multiplexed 7/8 video
-                 * + 1/8 audio, as in Ridge Racer Type 4's R4.STR. */
-                if ((psx->cd_mode & 0x40u) && psx_cd_is_xa_audio_rt(psx)) {
-                    psx_cd_fifo_sync_state(psx);
-                } else {
-                    u32 skip = psx_cd_data_skip(psx);
-                    u32 limit = psx_cd_data_limit(psx);
-                    if (psx->cd_read_cmd == 0x1Bu)
-                        psx_cd_fifo_push(psx, buf + skip, limit);
-                    else
-                        psx_cd_fifo_replace_single(psx, buf + skip, limit);
-                }
-
-                /* A streamed XA audio sector still completes the in-flight read
-                 * and raises INT1/Drive Ready status even if no CPU-visible data
-                 * is queued from it. Games that interleave video and XA audio
-                 * rely on the sector cadence itself, not only on the payload. */
-                {
-                    u8 rstat = psx_cd_stat(psx);
-                    psx_cd_set_resp(psx, 1u, &rstat, 1);
-                    if (psx->cd_pause_pending) {
-                        psx->cd_pause_pending = 0;
-                        psx->cd_read_cmd = 0;
-                        psx->cd_read_active = 0;
-                        psx->cd_read_after_seek = 0;
-                        rstat = psx_cd_stat(psx);
-                        psx_cd_set_second_resp(psx, 2u, &rstat, 1, 0);
-                    }
-                }
-            }
+            psx_cd_deliver_sector(psx);
         }
     }
 }
